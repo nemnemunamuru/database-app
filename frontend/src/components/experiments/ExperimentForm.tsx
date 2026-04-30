@@ -20,6 +20,7 @@ const EMPTY: Partial<Experiment> = {
   result_id: "",
   observation_id: "",
   file_id: "",
+  project_id: "",
   remarks: "",
 };
 
@@ -64,6 +65,7 @@ export default function ExperimentForm({ initial, onSaved, onCancel, onSavedAndN
           { key: "result_id", label: "result_id" },
           { key: "observation_id", label: "observation_id" },
           { key: "file_id", label: "file_id" },
+          { key: "project_id", label: "project_id" },
         ].map(({ key, label }) => (
           <Grid item xs={12} sm={6} key={key}>
             <TextField

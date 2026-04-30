@@ -3,8 +3,8 @@ import { Box, Chip, Divider, Tab, Tabs, Typography } from "@mui/material";
 import { EntityCrud } from "../components/masters/EntityCrud";
 import type { FieldDef, TItem } from "../components/masters/EntityCrud";
 import {
-  galvanoSystemsApi, laserDevicesApi, laserBeamsApi, laserBeamsCombinedApi,
-  fthetaApi, opticsApi, opticsCombinedApi, doeApi,
+  galvanoSystemsApi, laserDevicesApi, laserBeamsApi,
+  fthetaApi, opticsApi, doeApi,
   weldingConditionsApi, trajectorySetsApi,
   mainTrajectoriesApi, subTrajectoriesApi,
   lineParametersApi, wobblingParametersApi,
@@ -12,46 +12,10 @@ import {
   shieldingConditionsApi,
   resultsApi, observationsApi, filesApi,
   experimentMaterialsApi,
-  galvanoSystemDetail, laserDeviceDetail, opticsDetail, laserBeamDetail,
+  galvanoSystemDetail, laserDeviceDetail, opticsDetail,
   trajectorySetDetail,
+  masterProjectsApi,
 } from "../api/masters";
-
-// ── Color maps ────────────────────────────────────────────────────────────────
-const ROLE_COLOR: Record<string, string> = {
-  main:      "#ef5350",
-  OCT:       "#66bb6a",
-  sub:       "#42a5f5",
-  single:    "#7e57c2",
-  ring:      "#ff7043",
-  core_ring: "#8d6e63",
-};
-
-// Trajectory type color palette
-const TRAJ_MAIN_COLOR = "#1565c0";  // blue  – main trajectory / line
-const TRAJ_SUB_COLOR  = "#e65100";  // orange – sub trajectory / wobbling
-const TRAJ_SET_COLOR  = "#6a1b9a";  // purple – trajectory set (links both)
-
-/** sx helper: color-coded sub-tab with top border indicator */
-const ctab = (color: string) => ({
-  fontWeight: 600,
-  borderTop: `3px solid ${color}`,
-  borderRadius: "4px 4px 0 0",
-  mt: "2px",
-  "&.Mui-selected": { color, bgcolor: `${color}14` },
-  "&:not(.Mui-selected)": { color: `${color}99` },
-});
-
-const RoleChip = ({ role }: { role?: string | null }) => {
-  if (!role) return <span>—</span>;
-  const bg = ROLE_COLOR[role] ?? "#757575";
-  return (
-    <Chip
-      label={role}
-      size="small"
-      sx={{ bgcolor: bg, color: "white", fontWeight: "bold", height: 18, fontSize: 10 }}
-    />
-  );
-};
 
 // ── Tree builder helpers ──────────────────────────────────────────────────────
 const f = (v: any, unit = "") => (v != null ? `${v}${unit}` : "—");
@@ -59,7 +23,7 @@ const f = (v: any, unit = "") => (v != null ? `${v}${unit}` : "—");
 async function buildGalvanoTree(item: any): Promise<TItem[]> {
   const { data: d } = await galvanoSystemDetail(item.galvano_system_id);
   const nodes: TItem[] = [
-    { label: "galvano_type",     value: <RoleChip role={d.galvano_type} /> },
+    { label: "galvano_type",     value: f(d.galvano_type) },
     { label: "serial_number",    value: f(d.serial_number) },
     { label: "main_diameter_um", value: f(d.main_diameter_um, " µm") },
     { label: "sub_diameter_um",  value: f(d.sub_diameter_um, " µm") },
@@ -73,53 +37,43 @@ async function buildGalvanoTree(item: any): Promise<TItem[]> {
       { label: "ftheta_focal_mm", value: f(d.ftheta.ftheta_focal_mm, " mm") },
     ]});
   }
-  if (d.optics) {
-    const entryNodes: TItem[] = (d.optics.entries ?? []).map((oe: any) => {
-      const kids: TItem[] = [
-        { label: "collimator_focal_mm", value: f(oe.collimator_focal_mm, " mm") },
-        { label: "serial_number",       value: f(oe.serial_number) },
+  (d.optics ?? []).forEach((oe: any) => {
+    const opticsKids: TItem[] = [
+      { label: "optics_role",         value: f(oe.optics_role) },
+      { label: "manufacturer",        value: f(oe.manufacturer) },
+      { label: "collimator_focal_mm", value: f(oe.collimator_focal_mm, " mm") },
+      { label: "serial_number",       value: f(oe.serial_number) },
+    ];
+    if (oe.doe) {
+      opticsKids.push({ label: "DOE", children: [
+        { label: "manufacturer",  value: f(oe.doe.manufacturer) },
+        { label: "model_name",    value: f(oe.doe.model_name) },
+        { label: "profile_shape", value: f(oe.doe.profile_shape) },
+      ]});
+    }
+    if (oe.laser_device) {
+      const ld = oe.laser_device;
+      const ldKids: TItem[] = [
+        { label: "manufacturer",   value: f(ld.manufacturer) },
+        { label: "model_name",     value: f(ld.model_name) },
+        { label: "beam_structure", value: f(ld.beam_structure) },
       ];
-      if (oe.doe) {
-        kids.push({ label: "DOE", children: [
-          { label: "manufacturer",  value: f(oe.doe.manufacturer) },
-          { label: "model_name",    value: f(oe.doe.model_name) },
-          { label: "profile_shape", value: f(oe.doe.profile_shape) },
-        ]});
-      }
-      if (oe.laser_device) {
-        const ld = oe.laser_device;
-        const ldKids: TItem[] = [
-          { label: "manufacturer",   value: f(ld.manufacturer) },
-          { label: "model_name",     value: f(ld.model_name) },
-          { label: "beam_structure", value: f(ld.beam_structure) },
-        ];
-        if (ld.laser_beam) {
-          const lb = ld.laser_beam;
-          const lbKids: TItem[] = [
-            { label: "wavelength_nm",      value: f(lb.wavelength_nm, " nm") },
-            { label: "numerical_aperture", value: f(lb.numerical_aperture) },
-            { label: "m2_value",           value: f(lb.m2_value) },
-            { label: "bpp_mm_mrad",        value: f(lb.bpp_mm_mrad) },
-            ...(lb.entries ?? []).map((be: any): TItem => ({
-              label: <RoleChip role={be.beam_type} />,
-              children: [
-                { label: "core_diameter_um",       value: f(be.core_diameter_um, " µm") },
-                { label: "ring_inner_diameter_um", value: f(be.ring_inner_diameter_um, " µm") },
-                { label: "ring_outer_diameter_um", value: f(be.ring_outer_diameter_um, " µm") },
-              ],
-            })),
-          ];
-          ldKids.push({ label: "LASER_BEAM", children: lbKids });
-        }
-        kids.push({ label: "LASER_DEVICE", children: ldKids });
-      }
-      return { label: <RoleChip role={oe.optics_role} />, children: kids };
-    });
-    nodes.push({ label: "OPTICS", children: [
-      { label: "manufacturer", value: f(d.optics.manufacturer) },
-      ...entryNodes,
-    ]});
-  }
+      (ld.laser_beams ?? []).forEach((lb: any) => {
+        ldKids.push({
+          label: f(lb.beam_type),
+          children: [
+            { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
+            { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
+            { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
+            { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
+            { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
+          ],
+        });
+      });
+      opticsKids.push({ label: "LASER_DEVICE", children: ldKids });
+    }
+    nodes.push({ label: "OPTICS", children: opticsKids });
+  });
   return nodes;
 }
 
@@ -132,96 +86,75 @@ async function buildLaserDeviceTree(item: any): Promise<TItem[]> {
     { label: "beam_structure", value: f(d.beam_structure) },
     { label: "remarks",        value: f(d.remarks) },
   ];
-  if (d.laser_beam) {
-    const lb = d.laser_beam;
-    const lbKids: TItem[] = [
-      { label: "wavelength_nm",      value: f(lb.wavelength_nm, " nm") },
-      { label: "numerical_aperture", value: f(lb.numerical_aperture) },
-      { label: "m2_value",           value: f(lb.m2_value) },
-      { label: "bpp_mm_mrad",        value: f(lb.bpp_mm_mrad) },
-      ...(lb.entries ?? []).map((be: any): TItem => ({
-        label: <RoleChip role={be.beam_type} />,
-        children: [
-          { label: "core_diameter_um",       value: f(be.core_diameter_um, " µm") },
-          { label: "ring_inner_diameter_um", value: f(be.ring_inner_diameter_um, " µm") },
-          { label: "ring_outer_diameter_um", value: f(be.ring_outer_diameter_um, " µm") },
-        ],
-      })),
-    ];
-    nodes.push({ label: "LASER_BEAM", children: lbKids });
-  }
-  return nodes;
-}
-
-async function buildOpticsTree(item: any): Promise<TItem[]> {
-  const { data: d } = await opticsDetail(item.optics_id);
-  const nodes: TItem[] = [
-    { label: "manufacturer", value: f(d.manufacturer) },
-    { label: "remarks",      value: f(d.remarks) },
-  ];
-  (d.entries ?? []).forEach((oe: any) => {
-    const kids: TItem[] = [
-      { label: "collimator_focal_mm", value: f(oe.collimator_focal_mm, " mm") },
-      { label: "serial_number",       value: f(oe.serial_number) },
-    ];
-    if (oe.doe) {
-      kids.push({ label: "DOE", children: [
-        { label: "manufacturer",  value: f(oe.doe.manufacturer) },
-        { label: "model_name",    value: f(oe.doe.model_name) },
-      ]});
-    }
-    if (oe.laser_device) {
-      const ld = oe.laser_device;
-      const ldKids: TItem[] = [
-        { label: "manufacturer",   value: f(ld.manufacturer) },
-        { label: "model_name",     value: f(ld.model_name) },
-        { label: "beam_structure", value: f(ld.beam_structure) },
-      ];
-      if (ld.laser_beam) {
-        const lb = ld.laser_beam;
-        const lbKids: TItem[] = [
-          { label: "wavelength_nm",      value: f(lb.wavelength_nm, " nm") },
-          { label: "numerical_aperture", value: f(lb.numerical_aperture) },
-          { label: "m2_value",           value: f(lb.m2_value) },
-          { label: "bpp_mm_mrad",        value: f(lb.bpp_mm_mrad) },
-          ...(lb.entries ?? []).map((be: any): TItem => ({
-            label: <RoleChip role={be.beam_type} />,
-            children: [
-              { label: "core_diameter_um",       value: f(be.core_diameter_um, " µm") },
-              { label: "ring_inner_diameter_um", value: f(be.ring_inner_diameter_um, " µm") },
-              { label: "ring_outer_diameter_um", value: f(be.ring_outer_diameter_um, " µm") },
-            ],
-          })),
-        ];
-        ldKids.push({ label: "LASER_BEAM", children: lbKids });
-      }
-      kids.push({ label: "LASER_DEVICE", children: ldKids });
-    }
-    nodes.push({ label: <RoleChip role={oe.optics_role} />, children: kids });
-  });
-  return nodes;
-}
-
-async function buildLaserBeamTree(item: any): Promise<TItem[]> {
-  const { data: d } = await laserBeamDetail(item.laser_beam_id);
-  const nodes: TItem[] = [
-    { label: "wavelength_nm",      value: f(d.wavelength_nm, " nm") },
-    { label: "numerical_aperture", value: f(d.numerical_aperture) },
-    { label: "m2_value",           value: f(d.m2_value) },
-    { label: "bpp_mm_mrad",        value: f(d.bpp_mm_mrad) },
-    { label: "remarks",            value: f(d.remarks) },
-  ];
-  (d.entries ?? []).forEach((be: any) => {
+  (d.laser_beams ?? []).forEach((lb: any) => {
     nodes.push({
-      label: <RoleChip role={be.beam_type} />,
+      label: f(lb.beam_type),
       children: [
-        { label: "core_diameter_um",       value: f(be.core_diameter_um, " µm") },
-        { label: "ring_inner_diameter_um", value: f(be.ring_inner_diameter_um, " µm") },
-        { label: "ring_outer_diameter_um", value: f(be.ring_outer_diameter_um, " µm") },
+        { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
+        { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
+        { label: "m2_value",               value: f(lb.m2_value) },
+        { label: "bpp_mm_mrad",            value: f(lb.bpp_mm_mrad) },
+        { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
+        { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
+        { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
       ],
     });
   });
   return nodes;
+}
+
+async function buildOpticsTree(item: any): Promise<TItem[]> {
+  const { data: d } = await opticsDetail(item._id);
+  const nodes: TItem[] = [
+    { label: "optics_role",         value: f(d.optics_role) },
+    { label: "manufacturer",        value: f(d.manufacturer) },
+    { label: "collimator_focal_mm", value: f(d.collimator_focal_mm, " mm") },
+    { label: "serial_number",       value: f(d.serial_number) },
+    { label: "remarks",             value: f(d.remarks) },
+  ];
+  if (d.laser_device) {
+    const ld = d.laser_device;
+    const ldKids: TItem[] = [
+      { label: "manufacturer",   value: f(ld.manufacturer) },
+      { label: "model_name",     value: f(ld.model_name) },
+      { label: "beam_structure", value: f(ld.beam_structure) },
+    ];
+    (ld.laser_beams ?? []).forEach((lb: any) => {
+      ldKids.push({
+        label: f(lb.beam_type),
+        children: [
+          { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
+          { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
+          { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
+          { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
+          { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
+        ],
+      });
+    });
+    nodes.push({ label: "LASER_DEVICE", children: ldKids });
+  }
+  if (d.doe) {
+    nodes.push({ label: "DOE", children: [
+      { label: "manufacturer",  value: f(d.doe.manufacturer) },
+      { label: "model_name",    value: f(d.doe.model_name) },
+      { label: "profile_shape", value: f(d.doe.profile_shape) },
+    ]});
+  }
+  return nodes;
+}
+
+async function buildLaserBeamTree(item: any): Promise<TItem[]> {
+  return [
+    { label: "beam_type",              value: f(item.beam_type) },
+    { label: "wavelength_nm",          value: f(item.wavelength_nm, " nm") },
+    { label: "numerical_aperture",     value: f(item.numerical_aperture) },
+    { label: "m2_value",               value: f(item.m2_value) },
+    { label: "bpp_mm_mrad",            value: f(item.bpp_mm_mrad) },
+    { label: "core_diameter_um",       value: f(item.core_diameter_um, " µm") },
+    { label: "ring_inner_diameter_um", value: f(item.ring_inner_diameter_um, " µm") },
+    { label: "ring_outer_diameter_um", value: f(item.ring_outer_diameter_um, " µm") },
+    { label: "remarks",                value: f(item.remarks) },
+  ];
 }
 
 // ── Additional tree builders ──────────────────────────────────────────────────
@@ -237,61 +170,11 @@ async function buildFthetaTree(item: any): Promise<TItem[]> {
 }
 
 async function buildOpticsCombinedTree(item: any): Promise<TItem[]> {
-  const nodes: TItem[] = [
-    { label: "manufacturer",        value: f(item.manufacturer) },
-    { label: "optics_role",         value: <RoleChip role={item.optics_role} /> },
-    { label: "collimator_focal_mm", value: f(item.collimator_focal_mm, " mm") },
-    { label: "serial_number",       value: f(item.serial_number) },
-    { label: "remarks",             value: f(item.remarks) },
-  ];
-  if (item.laser_device_id) {
-    try {
-      const { data: ld } = await laserDevicesApi.get(item.laser_device_id);
-      const ldKids: TItem[] = [
-        { label: "manufacturer",   value: f(ld.manufacturer) },
-        { label: "model_name",     value: f(ld.model_name) },
-        { label: "beam_structure", value: f(ld.beam_structure) },
-      ];
-      if (ld.laser_beam_id) {
-        try {
-          const { data: lb } = await laserBeamsApi.get(ld.laser_beam_id);
-          const lbKids: TItem[] = [
-            { label: "wavelength_nm",      value: f(lb.wavelength_nm, " nm") },
-            { label: "numerical_aperture", value: f(lb.numerical_aperture) },
-            { label: "m2_value",           value: f(lb.m2_value) },
-            { label: "bpp_mm_mrad",        value: f(lb.bpp_mm_mrad) },
-          ];
-          ldKids.push({ label: "LASER_BEAM", children: lbKids });
-        } catch { /* not found */ }
-      }
-      nodes.push({ label: "LASER_DEVICE", children: ldKids });
-    } catch { /* not found */ }
-  }
-  if (item.doe_id) {
-    try {
-      const { data: doe } = await doeApi.get(item.doe_id);
-      nodes.push({ label: "DOE", children: [
-        { label: "manufacturer",  value: f(doe.manufacturer) },
-        { label: "model_name",    value: f(doe.model_name) },
-        { label: "profile_shape", value: f(doe.profile_shape) },
-      ]});
-    } catch { /* not found */ }
-  }
-  return nodes;
+  return buildOpticsTree(item);
 }
 
 async function buildLaserBeamCombinedTree(item: any): Promise<TItem[]> {
-  return [
-    { label: "wavelength_nm",          value: f(item.wavelength_nm, " nm") },
-    { label: "numerical_aperture",     value: f(item.numerical_aperture) },
-    { label: "m2_value",               value: f(item.m2_value) },
-    { label: "bpp_mm_mrad",            value: f(item.bpp_mm_mrad) },
-    { label: "beam_type",              value: <RoleChip role={item.beam_type} /> },
-    { label: "core_diameter_um",       value: f(item.core_diameter_um, " µm") },
-    { label: "ring_inner_diameter_um", value: f(item.ring_inner_diameter_um, " µm") },
-    { label: "ring_outer_diameter_um", value: f(item.ring_outer_diameter_um, " µm") },
-    { label: "remarks",                value: f(item.remarks) },
-  ];
+  return buildLaserBeamTree(item);
 }
 
 async function buildDoeTree(item: any): Promise<TItem[]> {
@@ -601,12 +484,7 @@ async function buildExperimentTree(item: any): Promise<TItem[]> {
 // ── Field definitions ─────────────────────────────────────────────────────────
 
 const GALVANO_FIELDS: FieldDef[] = [
-  {
-    key: "galvano_type", label: "galvano_type", type: "text",
-    renderCell: (v) => v != null
-      ? <Chip label={v} size="small" sx={{ bgcolor: ROLE_COLOR[v] ?? "#757575", color: "white", fontWeight: "bold" }} />
-      : "—",
-  },
+  { key: "galvano_type", label: "galvano_type", type: "text" },
   { key: "serial_number",    label: "serial_number",    type: "text" },
   { key: "main_diameter_um", label: "main_diameter_um", type: "number" },
   { key: "sub_diameter_um",  label: "sub_diameter_um",  type: "number" },
@@ -637,18 +515,14 @@ const LASER_DEVICE_FIELDS: FieldDef[] = [
   { key: "remarks", label: "remarks", type: "text" },
 ];
 
-// LASER_BEAM + LASER_BEAM_ENTRY を統合したフラットビュー（Excel形式：1行＝1エントリ）
+// LASER_BEAM フラットビュー（1行 = 1エントリ，複合PK: laser_beam_id + beam_type）
 const LASER_BEAM_COMBINED_FIELDS: FieldDef[] = [
+  { key: "laser_beam_id",      label: "laser_beam_id",      type: "text" },
+  { key: "beam_type", label: "beam_type", type: "text" },
   { key: "wavelength_nm",      label: "wavelength_nm",      type: "number" },
   { key: "numerical_aperture", label: "numerical_aperture", type: "number" },
   { key: "m2_value",           label: "m2_value",           type: "number" },
   { key: "bpp_mm_mrad",        label: "bpp_mm_mrad",        type: "number" },
-  {
-    key: "beam_type", label: "beam_type", type: "text",
-    renderCell: (v) => v != null
-      ? <Chip label={v} size="small" sx={{ bgcolor: ROLE_COLOR[v] ?? "#757575", color: "white", fontWeight: "bold" }} />
-      : "—",
-  },
   { key: "core_diameter_um",       label: "core_diameter_um",       type: "number" },
   { key: "ring_inner_diameter_um", label: "ring_inner_diameter_um", type: "number" },
   { key: "ring_outer_diameter_um", label: "ring_outer_diameter_um", type: "number" },
@@ -663,15 +537,11 @@ const FTHETA_FIELDS: FieldDef[] = [
   { key: "remarks",         label: "remarks",         type: "text" },
 ];
 
-// OPTICS + OPTICS_ENTRY を統合したフラットビュー（Excel形式：1行＝1エントリ）
+// OPTICS フラットビュー（1行 = 1エントリ，複合PK: optics_id + optics_role）
 const OPTICS_COMBINED_FIELDS: FieldDef[] = [
+  { key: "optics_id",           label: "optics_id",           type: "text" },
+  { key: "optics_role", label: "optics_role", type: "text" },
   { key: "manufacturer",        label: "manufacturer",        type: "text" },
-  {
-    key: "optics_role", label: "optics_role", type: "text",
-    renderCell: (v) => v != null
-      ? <Chip label={v} size="small" sx={{ bgcolor: ROLE_COLOR[v] ?? "#757575", color: "white", fontWeight: "bold" }} />
-      : "—",
-  },
   { key: "collimator_focal_mm", label: "collimator_focal_mm", type: "number" },
   { key: "serial_number",       label: "serial_number",       type: "text" },
   {
@@ -809,7 +679,7 @@ const RESULT_FIELDS: FieldDef[] = [
 
 const OBSERVATION_FIELDS: FieldDef[] = [
   { key: "observer_name",        label: "observer_name",        type: "text" },
-  { key: "observation_datetime", label: "observation_datetime", type: "text" },
+  { key: "observation_datetime", label: "observation_datetime", type: "date" },
   { key: "comment",              label: "comment",              type: "text" },
   { key: "remarks",              label: "remarks",              type: "text" },
 ];
@@ -817,6 +687,18 @@ const OBSERVATION_FIELDS: FieldDef[] = [
 const FILE_FIELDS: FieldDef[] = [
   { key: "remarks", label: "remarks", type: "text" },
 ];
+
+const PROJECT_FIELDS: FieldDef[] = [
+  { key: "project_id",   label: "project_id",   type: "text", hideInTable: true },
+  { key: "project_name", label: "project_name", type: "text" },
+];
+
+async function buildProjectTree(item: any): Promise<TItem[]> {
+  return [
+    { label: "project_id",   value: f(item.project_id) },
+    { label: "project_name", value: f(item.project_name) },
+  ];
+}
 
 const EXPERIMENT_MATERIAL_FIELDS: FieldDef[] = [
   {
@@ -864,6 +746,11 @@ const EXPERIMENT_FIELDS: FieldDef[] = [
     fkApi: filesApi, fkPk: "file_id",
     fkLabel: (o) => `(${String(o.file_id).slice(0, 6)})`,
   },
+  {
+    key: "project_id", label: "project_id", type: "fk",
+    fkApi: masterProjectsApi, fkPk: "project_id",
+    fkLabel: (o) => `${o.project_name ?? ""} (${String(o.project_id).slice(0, 6)})`,
+  },
   { key: "remarks", label: "remarks", type: "text" },
 ];
 
@@ -885,18 +772,23 @@ export default function MasterPage() {
   return (
     <Box>
       <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 3 }} variant="scrollable" scrollButtons="auto">
-        <Tab label="GALVANO_SYSTEM" />
-        <Tab label="WELDING_CONDITION" />
-        <Tab label="EXPERIMENT_MATERIAL" />
-        <Tab label="SHIELDING_CONDITION" />
-        <Tab label="RESULT" />
-        <Tab label="OBSERVATION" />
-        <Tab label="FILE" />
+        <Tab label="PROJECT"              sx={{ color: "#26a69a", fontWeight: 700, '&.Mui-selected': { color: "#26a69a" } }} />
+        <Tab label="GALVANO_SYSTEM"       sx={{ color: "#6a1b9a", fontWeight: 700, '&.Mui-selected': { color: "#6a1b9a" } }} />
+        <Tab label="WELDING_CONDITION"    sx={{ color: "#2e7d32", fontWeight: 700, '&.Mui-selected': { color: "#2e7d32" } }} />
+        <Tab label="EXPERIMENT_MATERIAL"  sx={{ color: "#00695c", fontWeight: 700, '&.Mui-selected': { color: "#00695c" } }} />
+        <Tab label="SHIELDING_CONDITION"  sx={{ color: "#5d4037", fontWeight: 700, '&.Mui-selected': { color: "#5d4037" } }} />
+        <Tab label="RESULT"               sx={{ color: "#ad1457", fontWeight: 700, '&.Mui-selected': { color: "#ad1457" } }} />
+        <Tab label="OBSERVATION"          sx={{ color: "#0277bd", fontWeight: 700, '&.Mui-selected': { color: "#0277bd" } }} />
+        <Tab label="FILE"                 sx={{ color: "#37474f", fontWeight: 700, '&.Mui-selected': { color: "#37474f" } }} />
       </Tabs>
 
       {tab === 0 && (
+        <EntityCrud title="PROJECT" fields={PROJECT_FIELDS} pkField="project_id" api={masterProjectsApi} expandable buildTree={buildProjectTree} />
+      )}
+
+      {tab === 1 && (
         <Box>
-          <Tabs value={subTab0} onChange={(_, v) => setSubTab0(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto" textColor="secondary" indicatorColor="secondary">
+          <Tabs value={subTab0} onChange={(_, v) => setSubTab0(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
             <Tab label="GALVANO_SYSTEM" />
             <Tab label="FTHETA" />
             <Tab label="OPTICS" />
@@ -904,24 +796,24 @@ export default function MasterPage() {
             <Tab label="LASER_BEAM" />
             <Tab label="DOE" />
           </Tabs>
-          {subTab0 === 0 && <EntityCrud title="GALVANO_SYSTEM" fields={GALVANO_FIELDS} pkField="galvano_system_id" api={galvanoSystemsApi} expandable buildTree={buildGalvanoTree} rowColor={(item) => ROLE_COLOR[item.galvano_type] ?? undefined} />}
+          {subTab0 === 0 && <EntityCrud title="GALVANO_SYSTEM" fields={GALVANO_FIELDS} pkField="galvano_system_id" api={galvanoSystemsApi} expandable buildTree={buildGalvanoTree} />}
           {subTab0 === 1 && <EntityCrud title="FTHETA" fields={FTHETA_FIELDS} pkField="ftheta_id" api={fthetaApi} expandable buildTree={buildFthetaTree} />}
-          {subTab0 === 2 && <EntityCrud title="OPTICS" fields={OPTICS_COMBINED_FIELDS} pkField="optics_entry_id" api={opticsCombinedApi} expandable buildTree={buildOpticsCombinedTree} rowColor={(item) => ROLE_COLOR[item.optics_role] ?? undefined} />}
+          {subTab0 === 2 && <EntityCrud title="OPTICS" fields={OPTICS_COMBINED_FIELDS} pkField="_id" api={opticsApi} expandable buildTree={buildOpticsTree} />}
           {subTab0 === 3 && <EntityCrud title="LASER_DEVICE" fields={LASER_DEVICE_FIELDS} pkField="laser_device_id" api={laserDevicesApi} expandable buildTree={buildLaserDeviceTree} />}
-          {subTab0 === 4 && <EntityCrud title="LASER_BEAM" fields={LASER_BEAM_COMBINED_FIELDS} pkField="laser_beam_entry_id" api={laserBeamsCombinedApi} expandable buildTree={buildLaserBeamCombinedTree} rowColor={(item) => ROLE_COLOR[item.beam_type] ?? undefined} />}
+          {subTab0 === 4 && <EntityCrud title="LASER_BEAM" fields={LASER_BEAM_COMBINED_FIELDS} pkField="_id" api={laserBeamsApi} expandable buildTree={buildLaserBeamCombinedTree} />}
           {subTab0 === 5 && <EntityCrud title="DOE" fields={DOE_FIELDS} pkField="doe_id" api={doeApi} expandable buildTree={buildDoeTree} />}
         </Box>
       )}
 
-      {tab === 1 && (
+      {tab === 2 && (
         <Box>
-          <Tabs value={subTab1} onChange={(_, v) => setSubTab1(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto" textColor="inherit" TabIndicatorProps={{ sx: { display: "none" } }}>
-            <Tab label="WELDING_CONDITION" sx={{ fontWeight: 600, '&.Mui-selected': { bgcolor: "action.selected" } }} />
-            <Tab label="TRAJECTORY_SET"    sx={ctab(TRAJ_SET_COLOR)} />
-            <Tab label="MAIN_TRAJECTORY"   sx={ctab(TRAJ_MAIN_COLOR)} />
-            <Tab label="LINE_PARAMETER"    sx={ctab(TRAJ_MAIN_COLOR)} />
-            <Tab label="SUB_TRAJECTORY"    sx={ctab(TRAJ_SUB_COLOR)} />
-            <Tab label="WOBBLING_PARAMETER" sx={ctab(TRAJ_SUB_COLOR)} />
+          <Tabs value={subTab1} onChange={(_, v) => setSubTab1(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
+            <Tab label="WELDING_CONDITION" />
+            <Tab label="TRAJECTORY_SET" />
+            <Tab label="MAIN_TRAJECTORY" />
+            <Tab label="LINE_PARAMETER" />
+            <Tab label="SUB_TRAJECTORY" />
+            <Tab label="WOBBLING_PARAMETER" />
           </Tabs>
           {subTab1 === 0 && <EntityCrud title="WELDING_CONDITION" fields={WELDING_FIELDS} pkField="welding_condition_id" api={weldingConditionsApi} expandable buildTree={buildWeldingTree} />}
           {subTab1 === 1 && <EntityCrud title="TRAJECTORY_SET" fields={TRAJECTORY_SET_FIELDS} pkField="trajectory_set_id" api={trajectorySetsApi} expandable buildTree={buildTrajectorySetTree} />}
@@ -932,9 +824,9 @@ export default function MasterPage() {
         </Box>
       )}
 
-      {tab === 2 && (
+      {tab === 3 && (
         <Box>
-          <Tabs value={subTab2} onChange={(_, v) => setSubTab2(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto" textColor="secondary" indicatorColor="secondary">
+          <Tabs value={subTab2} onChange={(_, v) => setSubTab2(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
             <Tab label="EXPERIMENT_MATERIAL" />
             <Tab label="MATERIAL_STATE" />
             <Tab label="MATERIAL" />
@@ -945,19 +837,19 @@ export default function MasterPage() {
         </Box>
       )}
 
-      {tab === 3 && (
+      {tab === 4 && (
         <EntityCrud title="SHIELDING_CONDITION" fields={SHIELDING_FIELDS} pkField="shielding_condition_id" api={shieldingConditionsApi} expandable buildTree={buildShieldingTree} />
       )}
 
-      {tab === 4 && (
+      {tab === 5 && (
         <EntityCrud title="RESULT" fields={RESULT_FIELDS} pkField="result_id" api={resultsApi} expandable buildTree={buildResultTree} />
       )}
 
-      {tab === 5 && (
+      {tab === 6 && (
         <EntityCrud title="OBSERVATION" fields={OBSERVATION_FIELDS} pkField="observation_id" api={observationsApi} expandable buildTree={buildObservationTree} />
       )}
 
-      {tab === 6 && (
+      {tab === 7 && (
         <EntityCrud title="FILE" fields={FILE_FIELDS} pkField="file_id" api={filesApi} expandable buildTree={buildFileTree} />
       )}
     </Box>

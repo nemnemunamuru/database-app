@@ -1,41 +1,71 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  AppBar, Box, CssBaseline, Tab, Tabs, Toolbar, Typography,
+  AppBar, Box, Button, CssBaseline, Dialog, DialogActions, DialogContent,
+  DialogTitle, IconButton, Tab, Tabs, TextField, Toolbar, Typography,
   createTheme, ThemeProvider,
 } from "@mui/material";
 import ScienceIcon from "@mui/icons-material/Science";
+import UndoIcon from "@mui/icons-material/Undo";
+import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
+import NewProjectPage from "./pages/NewProjectPage";
 import ExperimentPage from "./pages/ExperimentPage";
 import MasterPage from "./pages/MasterPage";
 import IoPage from "./pages/IoPage";
 import SettingsPage from "./pages/SettingsPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import { settingsApi } from "./api/settings";
+import { UndoProvider, useUndo } from "./context/UndoContext";
 
-const MAIN_TABS = ["Experiments", "Masters", "Import / Export", "Settings", "Documents"];
+const MAIN_TABS = ["New Project", "Experiments", "Masters", "Import / Export", "Settings", "Documents"];
 
-function App() {
+function AppContent() {
   const [mainTab, setMainTab] = useState(0);
   const [darkMode, setDarkMode] = useState(false);
+  const [role, setRole] = useState<"operator" | "administrator">("operator");
+  const [showLoginDialog, setShowLoginDialog] = useState(false);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [passwordError, setPasswordError] = useState(false);
+  const { canUndo, undoLabel, executeUndo } = useUndo();
+  const isAdmin = role === "administrator";
 
-  // Load theme preference from DB on mount
   useEffect(() => {
     settingsApi.get("theme_mode").then(r => {
       if (r.data.value === "dark") setDarkMode(true);
     }).catch(() => {});
   }, []);
 
+  const handleRoleIconClick = () => {
+    if (isAdmin) {
+      setRole("operator");
+    } else {
+      setPasswordInput("");
+      setPasswordError(false);
+      setShowLoginDialog(true);
+    }
+  };
+
+  const handleLoginSubmit = () => {
+    if (passwordInput === "admin") {
+      setRole("administrator");
+      setShowLoginDialog(false);
+    } else {
+      setPasswordError(true);
+    }
+  };
+
   const theme = useMemo(() =>
     createTheme({
       palette: {
         mode: darkMode ? "dark" : "light",
+        primary: { main: isAdmin ? "#c62828" : (darkMode ? "#90caf9" : "#1976d2") },
         ...(darkMode ? {
-          primary:   { main: "#90caf9" },
           secondary: { main: "#ce93d8" },
           background: { default: "#121212", paper: "#1e1e1e" },
         } : {}),
       },
     }),
-  [darkMode]);
+  [darkMode, isAdmin]);
 
   const handleToggleDark = (val: boolean) => {
     setDarkMode(val);
@@ -52,6 +82,26 @@ function App() {
             <Typography variant="h6" sx={{ flexGrow: 1 }}>
               Laser Experiment Database
             </Typography>
+            {canUndo && (
+              <Button
+                color="error"
+                size="small"
+                variant="contained"
+                startIcon={<UndoIcon />}
+                onClick={executeUndo}
+                sx={{ mr: 1 }}
+              >
+                Undo: {undoLabel}
+              </Button>
+            )}
+            <IconButton
+              color="inherit"
+              onClick={handleRoleIconClick}
+              sx={{ ml: 0.5 }}
+              title={isAdmin ? "Administrator — click to switch to Operator" : "Operator — click to switch to Administrator"}
+            >
+              {isAdmin ? <AdminPanelSettingsIcon /> : <AccountCircleIcon />}
+            </IconButton>
           </Toolbar>
           <Tabs
             value={mainTab}
@@ -66,14 +116,44 @@ function App() {
           </Tabs>
         </AppBar>
         <Box sx={{ px: 2, py: 1.5, flexGrow: 1, width: "100%", color: "text.primary" }}>
-          {mainTab === 0 && <ExperimentPage />}
-          {mainTab === 1 && <MasterPage />}
-          {mainTab === 2 && <IoPage />}
-          {mainTab === 3 && <SettingsPage darkMode={darkMode} onToggleDark={handleToggleDark} />}
-          {mainTab === 4 && <DocumentsPage darkMode={darkMode} />}
+          {mainTab === 0 && <NewProjectPage />}
+          {mainTab === 1 && <ExperimentPage />}
+          {mainTab === 2 && <MasterPage />}
+          {mainTab === 3 && <IoPage isAdmin={isAdmin} />}
+          {mainTab === 4 && <SettingsPage darkMode={darkMode} onToggleDark={handleToggleDark} isAdmin={isAdmin} />}
+          {mainTab === 5 && <DocumentsPage darkMode={darkMode} />}
         </Box>
+        <Dialog open={showLoginDialog} onClose={() => setShowLoginDialog(false)} maxWidth="xs" fullWidth>
+          <DialogTitle>Administrator Login</DialogTitle>
+          <DialogContent>
+            <TextField
+              autoFocus
+              fullWidth
+              label="Password"
+              type="password"
+              value={passwordInput}
+              onChange={e => { setPasswordInput(e.target.value); setPasswordError(false); }}
+              onKeyDown={e => { if (e.key === "Enter") handleLoginSubmit(); }}
+              error={passwordError}
+              helperText={passwordError ? "Incorrect password" : ""}
+              sx={{ mt: 1 }}
+            />
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setShowLoginDialog(false)}>Cancel</Button>
+            <Button onClick={handleLoginSubmit} variant="contained">Login</Button>
+          </DialogActions>
+        </Dialog>
       </Box>
     </ThemeProvider>
+  );
+}
+
+function App() {
+  return (
+    <UndoProvider>
+      <AppContent />
+    </UndoProvider>
   );
 }
 

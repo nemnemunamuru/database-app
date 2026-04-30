@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from backend.database import init_db
 from backend.settings_database import init_settings_db
-from backend.routers import experiments, masters, io, settings, docs
+from backend.routers import experiments, masters, io, settings, docs, projects
+from backend.routers import db_config
 
 app = FastAPI(title="Laser Experiment Database API")
 
@@ -22,6 +24,11 @@ def on_startup():
     init_settings_db()
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
 @app.get("/")
 def root():
     return {"message": "Laser Experiment Database API is running"}
@@ -32,4 +39,6 @@ app.include_router(masters.router, prefix="/api/masters", tags=["masters"])
 app.include_router(io.router, prefix="/api/io", tags=["io"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(docs.router, prefix="/api/docs", tags=["docs"])
+app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
+app.include_router(db_config.router, prefix="/api/db", tags=["db"])
 

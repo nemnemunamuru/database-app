@@ -17,6 +17,12 @@ class Setting(SettingsBase):
     value = Column(Text)
 
 
+class ReportConfig(SettingsBase):
+    __tablename__ = "report_config"
+    project_id    = Column(String, primary_key=True)
+    hidden_fields = Column(Text, default="[]")   # JSON array of field keys to hide
+
+
 def init_settings_db():
     SettingsBase.metadata.create_all(bind=engine)
 

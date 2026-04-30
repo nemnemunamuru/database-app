@@ -13,46 +13,32 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── Laser beam (parent: shared properties) ───────────────────────────────────
+# ── Laser beam (flat: composite PK laser_beam_id + beam_type) ────────────────
 class LaserBeam(Base):
     __tablename__ = "laser_beam"
-    laser_beam_id = Column(String, primary_key=True, default=new_uuid)
-    wavelength_nm = Column(Float)
-    numerical_aperture = Column(Float)
-    m2_value = Column(Float)
-    bpp_mm_mrad = Column(Float)
-    remarks = Column(Text)
-
-    laser_devices = relationship("LaserDevice", back_populates="laser_beam")
-    entries = relationship("LaserBeamEntry", back_populates="laser_beam",
-                           cascade="all, delete-orphan")
-
-
-# ── Laser beam entry (child: one row per beam_type) ──────────────────────────
-class LaserBeamEntry(Base):
-    __tablename__ = "laser_beam_entry"
-    laser_beam_entry_id = Column(String, primary_key=True, default=new_uuid)
-    laser_beam_id = Column(String, ForeignKey("laser_beam.laser_beam_id"))
-    beam_type = Column(String)
-    core_diameter_um = Column(Float)
+    laser_beam_id          = Column(String, primary_key=True)
+    beam_type              = Column(String, primary_key=True)
+    wavelength_nm          = Column(Float)
+    numerical_aperture     = Column(Float)
+    m2_value               = Column(Float)
+    bpp_mm_mrad            = Column(Float)
+    core_diameter_um       = Column(Float)
     ring_inner_diameter_um = Column(Float)
     ring_outer_diameter_um = Column(Float)
-
-    laser_beam = relationship("LaserBeam", back_populates="entries")
+    remarks                = Column(Text)
 
 
 class LaserDevice(Base):
     __tablename__ = "laser_device"
     laser_device_id = Column(String, primary_key=True, default=new_uuid)
-    manufacturer = Column(String)
-    model_name = Column(String)
-    serial_number = Column(String)
-    beam_structure = Column(String)
-    laser_beam_id = Column(String, ForeignKey("laser_beam.laser_beam_id"))
-    remarks = Column(Text)
+    manufacturer    = Column(String)
+    model_name      = Column(String)
+    serial_number   = Column(String)
+    beam_structure  = Column(String)
+    laser_beam_id   = Column(String)   # group ref → laser_beam.laser_beam_id (no FK)
+    remarks         = Column(Text)
 
-    laser_beam = relationship("LaserBeam", back_populates="laser_devices")
-    optics_entries = relationship("OpticsEntry", back_populates="laser_device")
+    optics_list = relationship("Optics", back_populates="laser_device")
 
 
 class Doe(Base):
@@ -64,35 +50,23 @@ class Doe(Base):
     profile_shape = Column(String)
     remarks = Column(Text)
 
-    optics_entries = relationship("OpticsEntry", back_populates="doe")
+    optics_list = relationship("Optics", back_populates="doe")
 
 
-# ── Optics (parent: shared manufacturer / remarks) ───────────────────────────
+# ── Optics (flat: composite PK optics_id + optics_role) ──────────────────────
 class Optics(Base):
     __tablename__ = "optics"
-    optics_id = Column(String, primary_key=True, default=new_uuid)
-    manufacturer = Column(String)
-    remarks = Column(Text)
-
-    galvano_systems = relationship("GalvanoSystem", back_populates="optics")
-    entries = relationship("OpticsEntry", back_populates="optics",
-                           cascade="all, delete-orphan")
-
-
-# ── Optics entry (child: one row per optics_role) ────────────────────────────
-class OpticsEntry(Base):
-    __tablename__ = "optics_entry"
-    optics_entry_id = Column(String, primary_key=True, default=new_uuid)
-    optics_id = Column(String, ForeignKey("optics.optics_id"))
-    optics_role = Column(String)
+    optics_id           = Column(String, primary_key=True)
+    optics_role         = Column(String, primary_key=True)
+    manufacturer        = Column(String)
     collimator_focal_mm = Column(Float)
-    serial_number = Column(String)
-    laser_device_id = Column(String, ForeignKey("laser_device.laser_device_id"))
-    doe_id = Column(String, ForeignKey("doe.doe_id"))
+    serial_number       = Column(String)
+    laser_device_id     = Column(String, ForeignKey("laser_device.laser_device_id"))
+    doe_id              = Column(String, ForeignKey("doe.doe_id"))
+    remarks             = Column(Text)
 
-    optics = relationship("Optics", back_populates="entries")
-    laser_device = relationship("LaserDevice", back_populates="optics_entries")
-    doe = relationship("Doe", back_populates="optics_entries")
+    laser_device = relationship("LaserDevice", back_populates="optics_list")
+    doe          = relationship("Doe", back_populates="optics_list")
 
 
 class Ftheta(Base):
@@ -113,14 +87,13 @@ class GalvanoSystem(Base):
     galvano_type = Column(String)
     serial_number = Column(String)
     ftheta_id = Column(String, ForeignKey("ftheta.ftheta_id"))
-    optics_id = Column(String, ForeignKey("optics.optics_id"))
+    optics_id = Column(String)   # group ref → optics.optics_id (no FK; composite PK)
     main_diameter_um = Column(Float)
     sub_diameter_um = Column(Float)
     oct_diameter_um = Column(Float)
     remarks = Column(Text)
 
     ftheta = relationship("Ftheta", back_populates="galvano_systems")
-    optics = relationship("Optics", back_populates="galvano_systems")
     experiments = relationship("Experiment", back_populates="galvano_system")
 
 
@@ -293,6 +266,14 @@ class File(Base):
     experiments = relationship("Experiment", back_populates="file")
 
 
+class Project(Base):
+    __tablename__ = "project"
+    project_id   = Column(String, primary_key=True, default=new_uuid)
+    project_name = Column(String)
+
+    experiments = relationship("Experiment", back_populates="project")
+
+
 class Experiment(Base):
     __tablename__ = "experiment"
     experiment_id = Column(String, primary_key=True, default=new_uuid)
@@ -303,6 +284,7 @@ class Experiment(Base):
     result_id = Column(String, ForeignKey("result.result_id"))
     observation_id = Column(String, ForeignKey("observation.observation_id"))
     file_id = Column(String, ForeignKey("file.file_id"))
+    project_id = Column(String, ForeignKey("project.project_id"))
     remarks = Column(Text)
 
     galvano_system = relationship("GalvanoSystem", back_populates="experiments")
@@ -312,6 +294,7 @@ class Experiment(Base):
     result = relationship("Result", back_populates="experiments")
     observation = relationship("Observation", back_populates="experiments")
     file = relationship("File", back_populates="experiments")
+    project = relationship("Project", back_populates="experiments")
 
 
 class ColumnDef(Base):

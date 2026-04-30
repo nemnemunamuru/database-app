@@ -1,129 +1,157 @@
-﻿import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  Alert, Box, Button, CircularProgress, Paper, Tab, Tabs, Typography,
+  Alert, Box, Button, CircularProgress, Paper,
+  Tab, Tabs, Typography,
 } from "@mui/material";
+import StorageIcon from "@mui/icons-material/Storage";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
-import DownloadIcon from "@mui/icons-material/Download";
 import MergeIcon from "@mui/icons-material/MergeType";
 import api from "../api/client";
 
-const BASE = "http://localhost:8000/api/io";
-
-export default function IoPage() {
+interface Props { isAdmin?: boolean; }
+export default function IoPage({ isAdmin = false }: Props) {
   const [tab, setTab] = useState(0);
-  const [uploading, setUploading] = useState(false);
-  const [result, setResult] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
+  useEffect(() => { setTab(0); }, [isAdmin]);
 
-  const clearStatus = () => { setResult(null); setError(null); };
+  // Import tab state
+  const [importing, setImporting] = useState(false);
+  const [importMsg, setImportMsg] = useState<{ text: string; ok: boolean } | null>(null);
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>, url: string) => {
+  // Add tab state
+  const [merging, setMerging] = useState(false);
+  const [mergeResult, setMergeResult] = useState<any>(null);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    setUploading(true); clearStatus();
+    e.target.value = "";
+    setImporting(true);
+    setImportMsg(null);
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const res = await api.post(url, formData, { headers: { "Content-Type": "multipart/form-data" } });
-      setResult(res.data);
+      const form = new FormData();
+      form.append("file", file);
+      await api.post("/api/io/import/db", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setImportMsg({
+        text: `Imported successfully. "experiment.db" has been replaced (backup saved as experiment.db.bak).`,
+        ok: true,
+      });
     } catch (err: any) {
-      setError(err.response?.data?.detail ?? "Upload failed");
+      setImportMsg({ text: err?.response?.data?.detail ?? "Import failed", ok: false });
     } finally {
-      setUploading(false);
-      e.target.value = "";
+      setImporting(false);
     }
   };
 
-  const StatusBlock = () => (
-    <>
-      {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
-      {result && (
-        <Alert severity="success" sx={{ mt: 2 }}>
-          <Typography variant="body2" fontWeight="bold">{result.message ?? "Done"}</Typography>
-          {result.details && (
-            <Box mt={1} sx={{ maxHeight: 260, overflowY: "auto" }}>
-              {Object.entries(result.details)
-                .filter(([, info]: [string, any]) => info.inserted > 0 || info.skipped > 0)
-                .map(([tbl, info]: [string, any]) => (
-                  <Typography key={tbl} variant="body2">
-                    <strong>{tbl}</strong>: +{info.inserted} inserted / {info.skipped} skipped
-                    {info.error ? ` — ${info.error}` : ""}
-                  </Typography>
-                ))}
-            </Box>
-          )}
-        </Alert>
-      )}
-    </>
-  );
+  const handleMerge = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    setMerging(true);
+    setMergeResult(null);
+    setMergeError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await api.post("/api/io/merge/db", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setMergeResult(res.data);
+    } catch (err: any) {
+      setMergeError(err?.response?.data?.detail ?? "Merge failed");
+    } finally {
+      setMerging(false);
+    }
+  };
 
   return (
-    <Box sx={{ maxWidth: 560 }}>
-      <Tabs value={tab} onChange={(_, v) => { setTab(v); clearStatus(); }} sx={{ mb: 3 }}>
-        <Tab label="Export" icon={<DownloadIcon fontSize="small" />} iconPosition="start" />
-        <Tab label="Import" icon={<UploadFileIcon fontSize="small" />} iconPosition="start" />
-        <Tab label="Add" icon={<MergeIcon fontSize="small" />} iconPosition="start" />
+    <Box>
+      <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 3 }}>
+        <Tab label="Export" />
+        {isAdmin && <Tab label="Import" />}
+        <Tab label="Add" />
       </Tabs>
 
       {/* ── Export ── */}
       {tab === 0 && (
-        <Paper sx={{ p: 2.5 }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>Export — Download DB</Typography>
-          <Typography variant="body2" color="text.secondary" mb={2}>
-            Download the current SQLite database file as a binary backup.
-          </Typography>
-          <Button
-            variant="contained"
-            startIcon={<DownloadIcon />}
-            onClick={() => window.open(`${BASE}/export/db`, "_blank")}
-          >
-            Download DB File
-          </Button>
-        </Paper>
-      )}
-
-      {/* ── Import ── */}
-      {tab === 1 && (
-        <Paper sx={{ p: 2.5 }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>Import — Replace DB</Typography>
-          <Typography variant="body2" color="text.secondary" mb={2}>
-            Upload a SQLite <code>.db</code> file to completely replace the current database.
-            A backup (<code>.db.bak</code>) is created automatically before replacing.
+        <Box sx={{ maxWidth: 480 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Download the current <code>experiment.db</code> as a SQLite binary file.
           </Typography>
           <Button
             variant="outlined"
-            component="label"
-            startIcon={uploading ? <CircularProgress size={18} color="inherit" /> : <UploadFileIcon />}
-            disabled={uploading}
+            startIcon={<StorageIcon />}
+            onClick={() => { window.open("http://localhost:8000/api/io/export/db", "_blank"); }}
           >
-            {uploading ? "Uploading..." : "Select DB File (.db)"}
-            <input type="file" hidden accept=".db" onChange={e => handleUpload(e, "/api/io/import/db")} />
+            Download experiment.db
           </Button>
-          <StatusBlock />
-        </Paper>
+        </Box>
       )}
 
-      {/* ── Add / Merge ── */}
-      {tab === 2 && (
-        <Paper sx={{ p: 2.5 }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>Add — Merge DB</Typography>
-          <Typography variant="body2" color="text.secondary" mb={2}>
-            Upload a SQLite <code>.db</code> file to merge it into the current database.
-            Records are added table by table in dependency order. Rows whose primary key
-            already exists in the current DB are skipped — no existing data is overwritten.
+      {/* ── Import ── */}
+      {isAdmin && tab === 1 && (
+        <Box sx={{ maxWidth: 560 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            <strong>Replace experiment.db with the selected file.</strong>
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            The uploaded <code>.db</code> file will be saved as <code>db/experiment.db</code>.
+            The current <code>experiment.db</code> is automatically backed up as{" "}
+            <code>experiment.db.bak</code> before being replaced.
           </Typography>
           <Button
             variant="contained"
-            color="secondary"
             component="label"
-            startIcon={uploading ? <CircularProgress size={18} color="inherit" /> : <MergeIcon />}
-            disabled={uploading}
+            startIcon={importing ? <CircularProgress size={18} color="inherit" /> : <UploadFileIcon />}
+            disabled={importing}
           >
-            {uploading ? "Merging..." : "Select DB File to Merge (.db)"}
-            <input type="file" hidden accept=".db" onChange={e => handleUpload(e, "/api/io/merge/db")} />
+            {importing ? "Importing…" : "Select .db file to import"}
+            <input type="file" accept=".db" hidden onChange={handleImport} />
           </Button>
-          <StatusBlock />
-        </Paper>
+          {importMsg && (
+            <Alert severity={importMsg.ok ? "success" : "error"} sx={{ mt: 2 }}>
+              {importMsg.text}
+            </Alert>
+          )}
+        </Box>
+      )}
+
+      {/* ── Add (merge) ── */}
+      {tab === (isAdmin ? 2 : 1) && (
+        <Box sx={{ maxWidth: 560 }}>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            <strong>Merge records from another .db file into experiment.db.</strong>
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Records from the uploaded file will be inserted into the current{" "}
+            <code>experiment.db</code>. Rows whose primary key already exists are skipped (no overwrite).
+          </Typography>
+          <Button
+            variant="contained"
+            component="label"
+            startIcon={merging ? <CircularProgress size={18} color="inherit" /> : <MergeIcon />}
+            disabled={merging}
+          >
+            {merging ? "Merging…" : "Select .db file to merge"}
+            <input type="file" accept=".db" hidden onChange={handleMerge} />
+          </Button>
+          {mergeError && (
+            <Alert severity="error" sx={{ mt: 2 }}>{mergeError}</Alert>
+          )}
+          {mergeResult && (
+            <Paper sx={{ p: 2, mt: 2 }}>
+              <Typography variant="subtitle2" gutterBottom>{mergeResult.message}</Typography>
+              {mergeResult.details &&
+                Object.entries(mergeResult.details).map(([table, info]: [string, any]) => (
+                  <Typography key={table} variant="body2">
+                    <strong>{table}</strong>: inserted {info.inserted} / skipped {info.skipped}
+                  </Typography>
+                ))}
+            </Paper>
+          )}
+        </Box>
       )}
     </Box>
   );

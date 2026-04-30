@@ -1,6 +1,6 @@
 import sqlite3
 
-con = sqlite3.connect('db/実験.db')
+con = sqlite3.connect('db/experiment.db')
 
 # Add is_id column
 con.execute('ALTER TABLE column_def ADD COLUMN is_id TEXT DEFAULT ""')

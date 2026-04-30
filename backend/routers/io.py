@@ -10,10 +10,10 @@ from fastapi import File as FastAPIFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from backend.database import get_db
+from backend.database import get_db, get_current_db_path, get_current_db_name
 from backend.models import (
-    Experiment, GalvanoSystem, Ftheta, Optics, OpticsEntry,
-    LaserDevice, LaserBeam, LaserBeamEntry,
+    Experiment, GalvanoSystem, Ftheta, Optics,
+    LaserDevice, LaserBeam,
     Doe, WeldingCondition, TrajectorySet, MainTrajectory, SubTrajectory,
     LineParameter, WobblingParameter,
     ExperimentMaterial, MaterialState,
@@ -26,11 +26,9 @@ router = APIRouter()
 # ── All models in FK dependency order (parents first) ────────────────────────
 MODEL_ORDER = [
     ("laser_beam",          LaserBeam,          "laser_beam_id"),
-    ("laser_beam_entry",    LaserBeamEntry,     "laser_beam_entry_id"),
     ("laser_device",        LaserDevice,        "laser_device_id"),
     ("doe",                 Doe,                "doe_id"),
     ("optics",              Optics,             "optics_id"),
-    ("optics_entry",        OpticsEntry,        "optics_entry_id"),
     ("ftheta",              Ftheta,             "ftheta_id"),
     ("galvano_system",      GalvanoSystem,      "galvano_system_id"),
     ("line_parameter",      LineParameter,      "main_trajectory_type_parameter_id"),
@@ -217,8 +215,6 @@ def list_tables():
     """Return all available table names."""
     return [name for name, _, _ in MODEL_ORDER]
 
-_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "db", "実験.db")
-_DB_PATH = os.path.normpath(_DB_PATH)
 
 
 # ── Export: download raw SQLite DB file ────────────────────────────────────
@@ -226,12 +222,13 @@ _DB_PATH = os.path.normpath(_DB_PATH)
 @router.get("/export/db")
 def export_db():
     """Download the SQLite database file."""
-    if not os.path.exists(_DB_PATH):
+    db_path = get_current_db_path()
+    if not os.path.exists(db_path):
         raise HTTPException(404, "Database file not found")
     return FileResponse(
-        path=_DB_PATH,
+        path=db_path,
         media_type="application/octet-stream",
-        filename="実験.db",
+        filename=get_current_db_name(),
     )
 
 
@@ -240,26 +237,24 @@ def export_db():
 @router.post("/import/db")
 async def import_db(file: UploadFile = FastAPIFile(...)):
     """Replace the SQLite database file with the uploaded one."""
-    # Back up the existing DB first
-    backup_path = _DB_PATH + ".bak"
-    if os.path.exists(_DB_PATH):
-        shutil.copy2(_DB_PATH, backup_path)
+    db_path = get_current_db_path()
+    backup_path = db_path + ".bak"
+    if os.path.exists(db_path):
+        shutil.copy2(db_path, backup_path)
     try:
         content = await file.read()
-        # Validate it's a SQLite file (magic bytes: SQLite format 3)
         if not content.startswith(b"SQLite format 3"):
             raise HTTPException(400, "Uploaded file does not appear to be a valid SQLite database")
-        with open(_DB_PATH, "wb") as f:
+        with open(db_path, "wb") as f:
             f.write(content)
         return {"message": "Database replaced successfully", "size": len(content)}
     except HTTPException:
-        # Restore backup on validation failure
         if os.path.exists(backup_path):
-            shutil.copy2(backup_path, _DB_PATH)
+            shutil.copy2(backup_path, db_path)
         raise
     except Exception as e:
         if os.path.exists(backup_path):
-            shutil.copy2(backup_path, _DB_PATH)
+            shutil.copy2(backup_path, db_path)
         raise HTTPException(500, f"Failed to replace database: {e}")
 
 

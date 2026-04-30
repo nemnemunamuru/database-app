@@ -1,222 +1,226 @@
 erDiagram
-    EXPERIMENT {
-        string experiment_id PK
-        string galvano_system_id FK
-        string welding_condition_id FK
-        string experiment_material_id FK
-        string shielding_condition_id FK
-        string result_id FK
-        string observation_id FK
-        string file_id FK
-        text remarks
-    }
-
-    EXPERIMENT }o--|| GALVANO_SYSTEM : "uses"
-    EXPERIMENT }o--|| WELDING_CONDITION : "uses"
-    EXPERIMENT }o--|| EXPERIMENT_MATERIAL : "uses"
-    EXPERIMENT }o--|| SHIELDING_CONDITION : "uses"
-    EXPERIMENT }o--|| RESULT : "uses"
-    EXPERIMENT }o--|| OBSERVATION : "uses"
-    EXPERIMENT }o--|| FILE : "uses"
-
-    GALVANO_SYSTEM {
-        string galvano_system_id PK
-        string galvano_type
-        string serial_number
-        string ftheta_id FK
-        string optics_id FK
-        float main_diameter_um
-        float sub_diameter_um
-        float oct_diameter_um
-    }
-    GALVANO_SYSTEM }o--|| FTHETA : "has"
-    GALVANO_SYSTEM }o--|| OPTICS : "has"
-
-    FTHETA {
-        string ftheta_id PK
-        string manufacturer
-        string model_name
-        string serial_number
-        float ftheta_focal_mm
-        text remarks
-    }
-
-    OPTICS {
-        string optics_id PK
-        string manufacturer
-        text remarks
-    }
-    OPTICS ||--o{ OPTICS_ENTRY : "has"
-
-    OPTICS_ENTRY {
-        string optics_entry_id PK
-        string optics_id FK
-        string optics_role
-        float collimator_focal_mm
-        string serial_number
-        string laser_device_id FK
-        string doe_id FK
-    }
-    OPTICS_ENTRY }o--|| LASER_DEVICE : "uses"
-    OPTICS_ENTRY }o--|| DOE : "uses"
-
-    LASER_DEVICE {
-        string laser_device_id PK
-        string manufacturer
-        string model_name
-        string serial_number
-        string beam_structure
-        string laser_beam_id FK
-        text remarks
-    }
-    LASER_DEVICE }o--|| LASER_BEAM : "has"
-
-    LASER_BEAM {
-        string laser_beam_id PK
-        float wavelength_nm
-        float numerical_aperture
-        float m2_value
-        float bpp_mm_mrad
-        text remarks
-    }
-    LASER_BEAM ||--o{ LASER_BEAM_ENTRY : "has"
-
-    LASER_BEAM_ENTRY {
-        string laser_beam_entry_id PK
-        string laser_beam_id FK
-        string beam_type
-        float core_diameter_um
-        float ring_inner_diameter_um
-        float ring_outer_diameter_um
-    }
-
     DOE {
-        string doe_id PK
+        uuid doe_id PK
         string manufacturer
         string model_name
         string serial_number
         string profile_shape
-        text remarks
+        string remarks
     }
 
-    WELDING_CONDITION {
-        string welding_condition_id PK
-        float main_power_w
-        float sub_power_w
-        float welding_speed_mm_s
-        float main_focus_offset_mm
-        float sub_focus_offset_mm
-        string trajectory_set_id FK
-        text remarks
-    }
-    WELDING_CONDITION }o--|| TRAJECTORY_SET : "uses"
-
-    TRAJECTORY_SET {
-        string trajectory_set_id PK
-        string main_trajectory_id FK
-        string sub_trajectory_id FK
-        string trajectory_csv_path
-        text remarks
-    }
-    TRAJECTORY_SET }o--|| MAIN_TRAJECTORY : "has"
-    TRAJECTORY_SET }o--|| SUB_TRAJECTORY : "has"
-
-    MAIN_TRAJECTORY {
-        string main_trajectory_id PK
-        string main_trajectory_type
-        string main_trajectory_parameter_id FK
-        text remarks
-    }
-    MAIN_TRAJECTORY }o--|| LINE_PARAMETER : "uses"
-
-    LINE_PARAMETER {
-        string main_trajectory_type_parameter_id PK
-        float length_mm
-        text remarks
-    }
-
-    SUB_TRAJECTORY {
-        string sub_trajectory_id PK
-        string sub_trajectory_type
-        string sub_trajectory_parameter_id FK
-        text remarks
-    }
-    SUB_TRAJECTORY }o--|| WOBBLING_PARAMETER : "uses"
-
-    WOBBLING_PARAMETER {
-        string sub_trajectory_type_parameter_id PK
-        float wobble_radius_mm
-        float wobble_frequency_hz
-        float circumferential_speed
-        text remarks
+    EXPERIMENT {
+        uuid experiment_id PK
+        datetime created_datetime
+        datetime updated_datetime
+        uuid galvano_system_id FK
+        uuid welding_condition_id FK
+        uuid experiment_material_id FK
+        uuid shielding_condition_id FK
+        uuid result_id FK
+        uuid observation_id FK
+        uuid file_id FK
+        string remarks
+        uuid project_id FK
     }
 
     EXPERIMENT_MATERIAL {
-        string experiment_material_id PK
-        string material_state_id FK
+        uuid experiment_material_id PK
+        uuid material_state_id FK
         string material_role
-        text remarks
+        string remarks
     }
-    EXPERIMENT_MATERIAL }o--|| MATERIAL_STATE : "uses"
 
-    MATERIAL_STATE {
-        string material_state_id PK
-        string material_id FK
-        float thickness_mm
-        float width_mm
-        float length_mm
-        string surface_condition
-        text remarks
+    FILE {
+        uuid file_id PK
+        string remarks
     }
-    MATERIAL_STATE }o--|| MATERIAL : "is"
+
+    FTHETA {
+        uuid ftheta_id PK
+        string manufacturer
+        string model_name
+        string serial_number
+        float ftheta_focal_mm
+        string remarks
+    }
+
+    GALVANO_SYSTEM {
+        uuid galvano_system_id PK
+        string galvano_type
+        string serial_number
+        uuid ftheta_id FK
+        uuid optics_id FK
+        float main_diameter_um
+        float sub_diameter_um
+        float oct_diameter_um
+        string remarks
+    }
+
+    LASER_BEAM {
+        uuid laser_beam_id PK
+        string beam_type
+        string wavelength_nm
+        string numerical_aperture
+        string m2_value
+        string bpp_mm_mrad
+        string core_diameter_um
+        string ring_inner_diameter_um
+        string ring_outer_diameter_um
+        string remarks
+    }
+
+    LASER_DEVICE {
+        uuid laser_device_id PK
+        string manufacturer
+        string model_name
+        string serial_number
+        string beam_structure
+        uuid laser_beam_id FK
+        string remarks
+    }
+
+    LINE_PARAMETER {
+        uuid main_trajectory_type_parameter_id PK
+        float length_mm
+        string remarks
+    }
+
+    MAIN_TRAJECTORY {
+        uuid main_trajectory_id PK
+        uuid main_trajectory_parameter_id FK
+        string main_trajectory_type
+        string remarks
+    }
 
     MATERIAL {
-        string material_id PK
+        uuid material_id PK
         string material_name
         string material_class
         float density_kg_m3
         float thermal_conductivity_w_mk
         float reflectivity_1070nm
-        text remarks
+        string remarks
+    }
+
+    MATERIAL_STATE {
+        uuid material_state_id PK
+        uuid material_id FK
+        float thickness_mm
+        float width_mm
+        float length_mm
+        string surface_condition
+        string remarks
+    }
+
+    OBSERVATION {
+        uuid observation_id PK
+        string observer_name
+        date observation_datetime
+        string comment
+        string remarks
+    }
+
+    OPTICS {
+        uuid optics_id PK
+        string manufacturer
+        string optics_role
+        float collimator_focal_mm
+        string serial_number
+        uuid laser_device_id FK
+        uuid doe_id FK
+        string remarks
+    }
+
+    PROJECT {
+        uuid project_id PK
+        string project_name
+    }
+
+    RESULT {
+        uuid result_id PK
+        string oct_depth_mm
+        string oct_surface_csv_path
+        string oct_depth_csv_path
+        string oct_result_csv_path
+        float cross_section_depth_mm
+        boolean spatter_flag
+        float gap_opening_mm
+        float spatter_severity
+        boolean crack_flag
+        boolean gap_opening_flag
+        boolean glass_contamination
+        boolean surface_contamination
+        float crack_severity
+        boolean penetration_flag
+        boolean dissimilar_material_flag
+        string remarks
     }
 
     SHIELDING_CONDITION {
-        string shielding_condition_id PK
+        uuid shielding_condition_id PK
         string gas_type
-        float gas_purity_percent
+        string gas_purity_percent
         float gas_flow_l_min
         float gas_pressure_kpa
         string nozzle_type
         float nozzle_diameter_mm
         float nozzle_distance_mm
         float nozzle_angle_deg
-        text remarks
+        string remarks
     }
 
-    RESULT {
-        string result_id PK
-        float oct_depth_mm
-        string oct_surface_csv_path
-        string oct_depth_csv_path
-        float cross_section_depth_mm
-        boolean spatter_flag
-        float spatter_severity
-        boolean gap_opening_flag
-        boolean crack_flag
-        float crack_severity
-        boolean penetration_flag
-        text remarks
+    SUB_TRAJECTORY {
+        uuid sub_trajectory_id PK
+        uuid sub_trajectory_parameter_id FK
+        string sub_trajectory_type
+        string remarks
     }
 
-    OBSERVATION {
-        string observation_id PK
-        string observer_name
-        string observation_datetime
-        text comment
-        text remarks
+    TRAJECTORY_SET {
+        uuid trajectory_set_id PK
+        uuid main_trajectory_id FK
+        uuid sub_trajectory_id FK
+        string trajectry_csv_path
+        string trajectory_csv_path
+        string remarks
     }
 
-    FILE {
-        string file_id PK
-        text remarks
+    WELDING_CONDITION {
+        uuid welding_condition_id PK
+        string main_power_w
+        string sub_power_w
+        string welding_speed_mm_s
+        string main_focus_offset_mm
+        string sub_focus_offset_mm
+        uuid trajectory_set_id FK
+        string remarks
     }
+
+    WOBBLING_PARAMETER {
+        uuid sub_trajectory_type_parameter_id PK
+        float wobble_radius_mm
+        float wobble_frequency_hz
+        float circumferential_speed
+        string remarks
+    }
+
+    EXPERIMENT }o--|| GALVANO_SYSTEM : ""
+    EXPERIMENT }o--|| WELDING_CONDITION : ""
+    EXPERIMENT }o--|| EXPERIMENT_MATERIAL : ""
+    EXPERIMENT }o--|| SHIELDING_CONDITION : ""
+    EXPERIMENT }o--|| RESULT : ""
+    EXPERIMENT }o--|| OBSERVATION : ""
+    EXPERIMENT }o--|| FILE : ""
+    EXPERIMENT }o--|| PROJECT : ""
+    EXPERIMENT_MATERIAL }o--|| MATERIAL_STATE : ""
+    GALVANO_SYSTEM }o--|| FTHETA : ""
+    GALVANO_SYSTEM }o--|| OPTICS : ""
+    LASER_DEVICE }o--|| LASER_BEAM : ""
+    MAIN_TRAJECTORY }o--|| LINE_PARAMETER : ""
+    MATERIAL_STATE }o--|| MATERIAL : ""
+    OPTICS }o--|| LASER_DEVICE : ""
+    OPTICS }o--|| DOE : ""
+    SUB_TRAJECTORY }o--|| WOBBLING_PARAMETER : ""
+    TRAJECTORY_SET }o--|| MAIN_TRAJECTORY : ""
+    TRAJECTORY_SET }o--|| SUB_TRAJECTORY : ""
+    WELDING_CONDITION }o--|| TRAJECTORY_SET : ""

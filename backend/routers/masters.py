@@ -1,18 +1,20 @@
 import uuid
 from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy import case
 from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_db
 from backend.models import (
     Material, MaterialState,
-    LaserBeam, LaserBeamEntry,
+    LaserBeam,
     LaserDevice,
-    Ftheta, Optics, OpticsEntry, Doe,
+    Ftheta, Optics, Doe,
     GalvanoSystem,
     LineParameter, MainTrajectory, WobblingParameter, SubTrajectory, TrajectorySet,
     WeldingCondition, ShieldingCondition,
     Result, Observation,
     ExperimentMaterial, File, Experiment,
+    Project,
     ColumnDef, Base,
 )
 
@@ -110,165 +112,73 @@ def delete_material_state(item_id: str, db: Session = Depends(get_db)):
     _delete_one(MaterialState, "material_state_id", item_id, db)
 
 
-# ── LaserBeam ─────────────────────────────────────────────────────────────────
+# ── LaserBeam (flat, composite PK: laser_beam_id + beam_type) ────────────────
+
+def _lb_row(item) -> dict:
+    row = _row(item)
+    row["_id"] = f"{item.laser_beam_id}~{item.beam_type}"
+    return row
+
+
+def _decode_lb_id(encoded: str):
+    parts = encoded.split("~", 1)
+    if len(parts) != 2:
+        raise HTTPException(400, "Invalid laser_beam id format (expected laser_beam_id~beam_type)")
+    return parts[0], parts[1]
+
+
+_BEAM_TYPE_ORDER = case(
+    (LaserBeam.beam_type == "single", 0),
+    (LaserBeam.beam_type == "ring",   1),
+    (LaserBeam.beam_type == "multi",  2),
+    else_=9,
+)
 
 @router.get("/laser-beams")
 def list_laser_beams(db: Session = Depends(get_db)):
-    return _list_all(LaserBeam, db)
+    return [_lb_row(r) for r in db.query(LaserBeam).order_by(LaserBeam.laser_beam_id, _BEAM_TYPE_ORDER).all()]
 
-# ── LaserBeam / combined (flat: one row per LaserBeamEntry with parent fields) ─
-
-@router.get("/laser-beams/combined")
-def list_laser_beams_combined(db: Session = Depends(get_db)):
-    entries = (
-        db.query(LaserBeamEntry)
-        .options(joinedload(LaserBeamEntry.laser_beam))
-        .all()
-    )
-    rows = []
-    for be in entries:
-        row = _row(be)
-        lb = be.laser_beam
-        row["wavelength_nm"]      = lb.wavelength_nm      if lb else None
-        row["numerical_aperture"] = lb.numerical_aperture if lb else None
-        row["m2_value"]           = lb.m2_value           if lb else None
-        row["bpp_mm_mrad"]        = lb.bpp_mm_mrad        if lb else None
-        row["remarks"]            = lb.remarks            if lb else None
-        rows.append(row)
-    return rows
-
-
-@router.post("/laser-beams/combined", status_code=201)
-def create_laser_beam_combined(body: dict = Body(...), db: Session = Depends(get_db)):
-    wavelength_nm      = body.pop("wavelength_nm", None)
-    numerical_aperture = body.pop("numerical_aperture", None)
-    m2_value           = body.pop("m2_value", None)
-    bpp_mm_mrad        = body.pop("bpp_mm_mrad", None)
-    remarks_val        = body.pop("remarks", None)
-    laser_beam_id      = body.pop("laser_beam_id", None)
-
-    if laser_beam_id:
-        parent = db.get(LaserBeam, laser_beam_id)
-        if not parent:
-            raise HTTPException(status_code=404, detail="LaserBeam parent not found")
-    else:
-        parent = LaserBeam(
-            laser_beam_id=str(uuid.uuid4()),
-            wavelength_nm=wavelength_nm,
-            numerical_aperture=numerical_aperture,
-            m2_value=m2_value,
-            bpp_mm_mrad=bpp_mm_mrad,
-            remarks=remarks_val,
-        )
-        db.add(parent)
-        db.flush()
-
-    entry_fields = {k: v for k, v in body.items()
-                    if hasattr(LaserBeamEntry, k) and k != "laser_beam_entry_id"}
-    entry_fields["laser_beam_id"] = parent.laser_beam_id
-    entry = LaserBeamEntry(laser_beam_entry_id=str(uuid.uuid4()), **entry_fields)
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    db.refresh(parent)
-
-    result = _row(entry)
-    result["wavelength_nm"]      = parent.wavelength_nm
-    result["numerical_aperture"] = parent.numerical_aperture
-    result["m2_value"]           = parent.m2_value
-    result["bpp_mm_mrad"]        = parent.bpp_mm_mrad
-    result["remarks"]            = parent.remarks
-    return result
-
-
-@router.put("/laser-beams/combined/{item_id}")
-def update_laser_beam_combined(item_id: str, body: dict = Body(...),
-                               db: Session = Depends(get_db)):
-    entry = db.get(LaserBeamEntry, item_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    wavelength_nm      = body.pop("wavelength_nm", None)
-    numerical_aperture = body.pop("numerical_aperture", None)
-    m2_value           = body.pop("m2_value", None)
-    bpp_mm_mrad        = body.pop("bpp_mm_mrad", None)
-    remarks_val        = body.pop("remarks", None)
-    body.pop("laser_beam_id", None)   # laser_beam_id は変更不可
-
-    if entry.laser_beam:
-        if wavelength_nm      is not None: entry.laser_beam.wavelength_nm      = wavelength_nm
-        if numerical_aperture is not None: entry.laser_beam.numerical_aperture = numerical_aperture
-        if m2_value           is not None: entry.laser_beam.m2_value           = m2_value
-        if bpp_mm_mrad        is not None: entry.laser_beam.bpp_mm_mrad        = bpp_mm_mrad
-        if remarks_val        is not None: entry.laser_beam.remarks            = remarks_val
-
-    for k, v in body.items():
-        if k != "laser_beam_entry_id" and hasattr(entry, k):
-            setattr(entry, k, v)
-
-    db.commit()
-    db.refresh(entry)
-
-    result = _row(entry)
-    lb = entry.laser_beam
-    result["wavelength_nm"]      = lb.wavelength_nm      if lb else None
-    result["numerical_aperture"] = lb.numerical_aperture if lb else None
-    result["m2_value"]           = lb.m2_value           if lb else None
-    result["bpp_mm_mrad"]        = lb.bpp_mm_mrad        if lb else None
-    result["remarks"]            = lb.remarks            if lb else None
-    return result
-
-
-@router.get("/laser-beams/{item_id}")
-def get_laser_beam(item_id: str, db: Session = Depends(get_db)):
-    return _get_one(LaserBeam, "laser_beam_id", item_id, db)
 
 @router.post("/laser-beams", status_code=201)
 def create_laser_beam(body: dict = Body(...), db: Session = Depends(get_db)):
-    return _create_one(LaserBeam, "laser_beam_id", body, db)
+    body.pop("_id", None)
+    laser_beam_id = body.pop("laser_beam_id", None) or str(uuid.uuid4())
+    beam_type = body.get("beam_type")
+    if not beam_type:
+        raise HTTPException(400, "beam_type is required")
+    if db.get(LaserBeam, (laser_beam_id, beam_type)):
+        raise HTTPException(409, "LaserBeam row already exists")
+    filtered = {k: v for k, v in body.items() if hasattr(LaserBeam, k)}
+    item = LaserBeam(laser_beam_id=laser_beam_id, **filtered)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return _lb_row(item)
 
-@router.put("/laser-beams/{item_id}")
-def update_laser_beam(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(LaserBeam, "laser_beam_id", item_id, body, db)
 
-@router.delete("/laser-beams/{item_id}", status_code=204)
-def delete_laser_beam(item_id: str, db: Session = Depends(get_db)):
-    _delete_one(LaserBeam, "laser_beam_id", item_id, db)
-
-@router.get("/laser-beams/{item_id}/detail")
-def get_laser_beam_detail(item_id: str, db: Session = Depends(get_db)):
-    lb = (db.query(LaserBeam)
-          .options(joinedload(LaserBeam.entries))
-          .filter(LaserBeam.laser_beam_id == item_id)
-          .first())
-    if not lb:
+@router.put("/laser-beams/{encoded_id}")
+def update_laser_beam(encoded_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    lb_id, btype = _decode_lb_id(encoded_id)
+    item = db.get(LaserBeam, (lb_id, btype))
+    if not item:
         raise HTTPException(404)
-    result = _row(lb)
-    result["entries"] = [_row(e) for e in lb.entries]
-    return result
+    body.pop("_id", None)
+    for k, v in body.items():
+        if k not in ("laser_beam_id", "beam_type") and hasattr(item, k):
+            setattr(item, k, v)
+    db.commit()
+    db.refresh(item)
+    return _lb_row(item)
 
 
-# ── LaserBeamEntry ────────────────────────────────────────────────────────────
-
-@router.get("/laser-beam-entries")
-def list_laser_beam_entries(db: Session = Depends(get_db)):
-    return _list_all(LaserBeamEntry, db)
-
-@router.get("/laser-beam-entries/{item_id}")
-def get_laser_beam_entry(item_id: str, db: Session = Depends(get_db)):
-    return _get_one(LaserBeamEntry, "laser_beam_entry_id", item_id, db)
-
-@router.post("/laser-beam-entries", status_code=201)
-def create_laser_beam_entry(body: dict = Body(...), db: Session = Depends(get_db)):
-    return _create_one(LaserBeamEntry, "laser_beam_entry_id", body, db)
-
-@router.put("/laser-beam-entries/{item_id}")
-def update_laser_beam_entry(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(LaserBeamEntry, "laser_beam_entry_id", item_id, body, db)
-
-@router.delete("/laser-beam-entries/{item_id}", status_code=204)
-def delete_laser_beam_entry(item_id: str, db: Session = Depends(get_db)):
-    _delete_one(LaserBeamEntry, "laser_beam_entry_id", item_id, db)
+@router.delete("/laser-beams/{encoded_id}", status_code=204)
+def delete_laser_beam(encoded_id: str, db: Session = Depends(get_db)):
+    lb_id, btype = _decode_lb_id(encoded_id)
+    item = db.get(LaserBeam, (lb_id, btype))
+    if not item:
+        raise HTTPException(404)
+    db.delete(item)
+    db.commit()
 
 
 # ── LaserDevice ───────────────────────────────────────────────────────────────
@@ -295,20 +205,15 @@ def delete_laser_device(item_id: str, db: Session = Depends(get_db)):
 
 @router.get("/laser-devices/{item_id}/detail")
 def get_laser_device_detail(item_id: str, db: Session = Depends(get_db)):
-    ld = (db.query(LaserDevice)
-          .options(
-              joinedload(LaserDevice.laser_beam).joinedload(LaserBeam.entries)
-          )
-          .filter(LaserDevice.laser_device_id == item_id)
-          .first())
+    ld = db.get(LaserDevice, item_id)
     if not ld:
         raise HTTPException(404)
     result = _row(ld)
-    if ld.laser_beam:
-        lb = ld.laser_beam
-        result["laser_beam"] = {**_row(lb), "entries": [_row(e) for e in lb.entries]}
+    if ld.laser_beam_id:
+        lb_rows = db.query(LaserBeam).filter(LaserBeam.laser_beam_id == ld.laser_beam_id).all()
+        result["laser_beams"] = [_lb_row(r) for r in lb_rows]
     else:
-        result["laser_beam"] = None
+        result["laser_beams"] = []
     return result
 
 
@@ -335,160 +240,82 @@ def delete_ftheta(item_id: str, db: Session = Depends(get_db)):
     _delete_one(Ftheta, "ftheta_id", item_id, db)
 
 
-# ── Optics ────────────────────────────────────────────────────────────────────
+# ── Optics (flat, composite PK: optics_id + optics_role) ─────────────────────
+
+def _optics_row(item) -> dict:
+    row = _row(item)
+    row["_id"] = f"{item.optics_id}~{item.optics_role}"
+    return row
+
+
+def _decode_optics_id(encoded: str):
+    parts = encoded.split("~", 1)
+    if len(parts) != 2:
+        raise HTTPException(400, "Invalid optics id format (expected optics_id~optics_role)")
+    return parts[0], parts[1]
+
+
+_OPTICS_ROLE_ORDER = case(
+    (Optics.optics_role == "main", 0),
+    (Optics.optics_role == "sub",  1),
+    (Optics.optics_role == "OCT",  2),
+    else_=9,
+)
 
 @router.get("/optics")
 def list_optics(db: Session = Depends(get_db)):
-    return _list_all(Optics, db)
+    return [_optics_row(r) for r in db.query(Optics).order_by(Optics.optics_id, _OPTICS_ROLE_ORDER).all()]
 
-# ── Optics / combined (flat: one row per OpticsEntry with parent fields) ──────
-
-@router.get("/optics/combined")
-def list_optics_combined(db: Session = Depends(get_db)):
-    entries = (
-        db.query(OpticsEntry)
-        .options(joinedload(OpticsEntry.optics))
-        .all()
-    )
-    rows = []
-    for oe in entries:
-        row = _row(oe)
-        row["manufacturer"] = oe.optics.manufacturer if oe.optics else None
-        row["remarks"]      = oe.optics.remarks      if oe.optics else None
-        rows.append(row)
-    return rows
-
-
-@router.post("/optics/combined", status_code=201)
-def create_optics_combined(body: dict = Body(...), db: Session = Depends(get_db)):
-    manufacturer = body.pop("manufacturer", None)
-    remarks_val  = body.pop("remarks", None)
-    optics_id    = body.pop("optics_id", None)
-
-    if optics_id:
-        parent = db.get(Optics, optics_id)
-        if not parent:
-            raise HTTPException(status_code=404, detail="Optics parent not found")
-    else:
-        parent = Optics(optics_id=str(uuid.uuid4()),
-                        manufacturer=manufacturer, remarks=remarks_val)
-        db.add(parent)
-        db.flush()
-
-    entry_fields = {k: v for k, v in body.items()
-                    if hasattr(OpticsEntry, k) and k != "optics_entry_id"}
-    entry_fields["optics_id"] = parent.optics_id
-    entry = OpticsEntry(optics_entry_id=str(uuid.uuid4()), **entry_fields)
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    db.refresh(parent)
-
-    result = _row(entry)
-    result["manufacturer"] = parent.manufacturer
-    result["remarks"]      = parent.remarks
-    return result
-
-
-@router.put("/optics/combined/{item_id}")
-def update_optics_combined(item_id: str, body: dict = Body(...),
-                           db: Session = Depends(get_db)):
-    entry = db.get(OpticsEntry, item_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    manufacturer = body.pop("manufacturer", None)
-    remarks_val  = body.pop("remarks", None)
-    body.pop("optics_id", None)   # optics_id は変更不可
-
-    if entry.optics:
-        if manufacturer is not None:
-            entry.optics.manufacturer = manufacturer
-        if remarks_val is not None:
-            entry.optics.remarks = remarks_val
-
-    for k, v in body.items():
-        if k != "optics_entry_id" and hasattr(entry, k):
-            setattr(entry, k, v)
-
-    db.commit()
-    db.refresh(entry)
-
-    result = _row(entry)
-    result["manufacturer"] = entry.optics.manufacturer if entry.optics else None
-    result["remarks"]      = entry.optics.remarks      if entry.optics else None
-    return result
-
-
-@router.get("/optics/{item_id}")
-def get_optics(item_id: str, db: Session = Depends(get_db)):
-    return _get_one(Optics, "optics_id", item_id, db)
 
 @router.post("/optics", status_code=201)
 def create_optics(body: dict = Body(...), db: Session = Depends(get_db)):
-    return _create_one(Optics, "optics_id", body, db)
+    body.pop("_id", None)
+    optics_id = body.pop("optics_id", None) or str(uuid.uuid4())
+    optics_role = body.get("optics_role")
+    if not optics_role:
+        raise HTTPException(400, "optics_role is required")
+    if db.get(Optics, (optics_id, optics_role)):
+        raise HTTPException(409, "Optics row already exists")
+    filtered = {k: v for k, v in body.items() if hasattr(Optics, k)}
+    item = Optics(optics_id=optics_id, **filtered)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return _optics_row(item)
 
-@router.put("/optics/{item_id}")
-def update_optics(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(Optics, "optics_id", item_id, body, db)
 
-@router.delete("/optics/{item_id}", status_code=204)
-def delete_optics(item_id: str, db: Session = Depends(get_db)):
-    _delete_one(Optics, "optics_id", item_id, db)
-
-@router.get("/optics/{item_id}/detail")
-def get_optics_detail(item_id: str, db: Session = Depends(get_db)):
-    optics = (db.query(Optics)
-              .options(
-                  joinedload(Optics.entries).joinedload(OpticsEntry.laser_device)
-                      .joinedload(LaserDevice.laser_beam).joinedload(LaserBeam.entries),
-                  joinedload(Optics.entries).joinedload(OpticsEntry.doe),
-              )
-              .filter(Optics.optics_id == item_id)
-              .first())
-    if not optics:
+@router.put("/optics/{encoded_id}")
+def update_optics(encoded_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    oid, role = _decode_optics_id(encoded_id)
+    item = db.get(Optics, (oid, role))
+    if not item:
         raise HTTPException(404)
-    result = _row(optics)
-    entries = []
-    for oe in optics.entries:
-        e = _row(oe)
-        if oe.laser_device:
-            ld = oe.laser_device
-            lb = ld.laser_beam
-            e["laser_device"] = {
-                **_row(ld),
-                "laser_beam": ({**_row(lb), "entries": [_row(be) for be in lb.entries]} if lb else None),
-            }
-        else:
-            e["laser_device"] = None
-        e["doe"] = _row(oe.doe) if oe.doe else None
-        entries.append(e)
-    result["entries"] = entries
-    return result
+    body.pop("_id", None)
+    for k, v in body.items():
+        if k not in ("optics_id", "optics_role") and hasattr(item, k):
+            setattr(item, k, v)
+    db.commit()
+    db.refresh(item)
+    return _optics_row(item)
 
 
-# ── OpticsEntry ───────────────────────────────────────────────────────────────
+@router.delete("/optics/{encoded_id}", status_code=204)
+def delete_optics(encoded_id: str, db: Session = Depends(get_db)):
+    oid, role = _decode_optics_id(encoded_id)
+    item = db.get(Optics, (oid, role))
+    if not item:
+        raise HTTPException(404)
+    db.delete(item)
+    db.commit()
 
-@router.get("/optics-entries")
-def list_optics_entries(db: Session = Depends(get_db)):
-    return _list_all(OpticsEntry, db)
 
-@router.get("/optics-entries/{item_id}")
-def get_optics_entry(item_id: str, db: Session = Depends(get_db)):
-    return _get_one(OpticsEntry, "optics_entry_id", item_id, db)
-
-@router.post("/optics-entries", status_code=201)
-def create_optics_entry(body: dict = Body(...), db: Session = Depends(get_db)):
-    return _create_one(OpticsEntry, "optics_entry_id", body, db)
-
-@router.put("/optics-entries/{item_id}")
-def update_optics_entry(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(OpticsEntry, "optics_entry_id", item_id, body, db)
-
-@router.delete("/optics-entries/{item_id}", status_code=204)
-def delete_optics_entry(item_id: str, db: Session = Depends(get_db)):
-    _delete_one(OpticsEntry, "optics_entry_id", item_id, db)
-
+@router.get("/optics/{encoded_id}/detail")
+def get_optics_detail(encoded_id: str, db: Session = Depends(get_db)):
+    oid, role = _decode_optics_id(encoded_id)
+    item = db.get(Optics, (oid, role))
+    if not item:
+        raise HTTPException(404)
+    return _enrich_optics(item, db)
 
 # ── Doe ───────────────────────────────────────────────────────────────────────
 
@@ -537,43 +364,39 @@ def delete_galvano_system(item_id: str, db: Session = Depends(get_db)):
 
 @router.get("/galvano-systems/{item_id}/detail")
 def get_galvano_system_detail(item_id: str, db: Session = Depends(get_db)):
-    gs = (db.query(GalvanoSystem)
-          .options(
-              joinedload(GalvanoSystem.ftheta),
-              joinedload(GalvanoSystem.optics)
-                  .joinedload(Optics.entries)
-                  .joinedload(OpticsEntry.laser_device)
-                  .joinedload(LaserDevice.laser_beam)
-                  .joinedload(LaserBeam.entries),
-              joinedload(GalvanoSystem.optics)
-                  .joinedload(Optics.entries)
-                  .joinedload(OpticsEntry.doe),
-          )
-          .filter(GalvanoSystem.galvano_system_id == item_id)
-          .first())
+    gs = db.get(GalvanoSystem, item_id)
     if not gs:
         raise HTTPException(404)
     result = _row(gs)
-    result["ftheta"] = _row(gs.ftheta) if gs.ftheta else None
-    if gs.optics:
-        entries = []
-        for oe in gs.optics.entries:
-            e = _row(oe)
-            if oe.laser_device:
-                ld = oe.laser_device
-                lb = ld.laser_beam
-                e["laser_device"] = {
-                    **_row(ld),
-                    "laser_beam": ({**_row(lb), "entries": [_row(be) for be in lb.entries]} if lb else None),
-                }
-            else:
-                e["laser_device"] = None
-            e["doe"] = _row(oe.doe) if oe.doe else None
-            entries.append(e)
-        result["optics"] = {**_row(gs.optics), "entries": entries}
+    result["ftheta"] = _row(db.get(Ftheta, gs.ftheta_id)) if gs.ftheta_id else None
+    if gs.optics_id:
+        optics_rows = db.query(Optics).filter(Optics.optics_id == gs.optics_id).order_by(_OPTICS_ROLE_ORDER).all()
+        result["optics"] = [_enrich_optics(r, db) for r in optics_rows]
     else:
-        result["optics"] = None
+        result["optics"] = []
     return result
+
+
+# ── Shared enrichment helpers ─────────────────────────────────────────────────
+
+def _enrich_optics(item: Optics, db) -> dict:
+    row = _optics_row(item)
+    if item.laser_device_id:
+        ld = db.get(LaserDevice, item.laser_device_id)
+        if ld:
+            ld_data = _row(ld)
+            if ld.laser_beam_id:
+                lb_rows = db.query(LaserBeam).filter(LaserBeam.laser_beam_id == ld.laser_beam_id).all()
+                ld_data["laser_beams"] = [_lb_row(r) for r in lb_rows]
+            else:
+                ld_data["laser_beams"] = []
+            row["laser_device"] = ld_data
+        else:
+            row["laser_device"] = None
+    else:
+        row["laser_device"] = None
+    row["doe"] = _row(db.get(Doe, item.doe_id)) if item.doe_id else None
+    return row
 
 
 # ── WeldingCondition ──────────────────────────────────────────────────────────
@@ -834,6 +657,29 @@ def delete_file(item_id: str, db: Session = Depends(get_db)):
     _delete_one(File, "file_id", item_id, db)
 
 
+# ── Project ───────────────────────────────────────────────────────────────────
+
+@router.get("/projects")
+def list_projects_master(db: Session = Depends(get_db)):
+    return _list_all(Project, db)
+
+@router.get("/projects/{item_id}")
+def get_project_master(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(Project, "project_id", item_id, db)
+
+@router.post("/projects", status_code=201)
+def create_project_master(body: dict = Body(...), db: Session = Depends(get_db)):
+    return _create_one(Project, "project_id", body, db)
+
+@router.put("/projects/{item_id}")
+def update_project_master(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    return _update_one(Project, "project_id", item_id, body, db)
+
+@router.delete("/projects/{item_id}", status_code=204)
+def delete_project_master(item_id: str, db: Session = Depends(get_db)):
+    _delete_one(Project, "project_id", item_id, db)
+
+
 # ── ExperimentMaterial ───────────────────────────────────────────────────────
 
 @router.get("/experiment-materials")
@@ -883,14 +729,34 @@ def delete_experiment(item_id: str, db: Session = Depends(get_db)):
 # ── ColumnDef ───────────────────────────────────────────────────────────────────────────────
 
 @router.get("/column-defs")
-def list_column_defs(db: Session = Depends(get_db)):
-    rows = db.query(ColumnDef).order_by(ColumnDef.table_name, ColumnDef.order_index).all()
-    return [_row(r) for r in rows]
+def list_column_defs(table_name: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(ColumnDef).order_by(ColumnDef.table_name, ColumnDef.order_index)
+    if table_name:
+        q = q.filter(ColumnDef.table_name == table_name)
+    return [_row(r) for r in q.all()]
 
 
 @router.post("/column-defs/init", status_code=201)
 def init_column_defs(db: Session = Depends(get_db)):
-    """Auto-populate ColumnDef from SQLAlchemy models (skips existing entries)."""
+    """Auto-populate ColumnDef from SQLAlchemy models (deduplicates existing, then adds missing)."""
+    # ── Step 1: deduplicate existing rows ──────────────────────────────────
+    from collections import defaultdict
+    all_rows = db.query(ColumnDef).all()
+    groups: dict = defaultdict(list)
+    for r in all_rows:
+        groups[(r.table_name, r.column_name)].append(r)
+    deleted = 0
+    for key, rows in groups.items():
+        if len(rows) <= 1:
+            continue
+        # prefer the row with is_id='pk', then smallest order_index
+        rows.sort(key=lambda r: (0 if r.is_id == "pk" else 1, r.order_index or 0))
+        for dup in rows[1:]:
+            db.delete(dup)
+            deleted += 1
+    db.commit()
+
+    # ── Step 2: add missing column defs ────────────────────────────────────
     existing = {(r.table_name, r.column_name) for r in db.query(ColumnDef).all()}
     created = 0
     for mapper in Base.registry.mappers:
@@ -920,12 +786,40 @@ def init_column_defs(db: Session = Depends(get_db)):
             ))
             created += 1
     db.commit()
-    return {"created": created}
+    return {"deleted_duplicates": deleted, "created": created}
+
+
+@router.post("/column-defs/sync-fk/{column_name}")
+def sync_fk_for_column(column_name: str, db: Session = Depends(get_db)):
+    """Set is_id='fk' on all column_def rows with given column_name that aren't already 'pk'."""
+    rows = db.query(ColumnDef).filter(
+        ColumnDef.column_name == column_name,
+        ColumnDef.is_id != "pk",
+    ).all()
+    for row in rows:
+        row.is_id = "fk"
+    db.commit()
+    return {"updated": len(rows)}
 
 
 @router.post("/column-defs", status_code=201)
 def create_column_def(body: dict = Body(...), db: Session = Depends(get_db)):
     return _create_one(ColumnDef, "column_def_id", body, db)
+
+
+@router.get("/column-defs/{item_id}")
+def get_column_def(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(ColumnDef, "column_def_id", item_id, db)
+
+
+@router.delete("/column-defs/fk-by-column/{column_name}", status_code=204)
+def delete_fk_by_column(column_name: str, db: Session = Depends(get_db)):
+    """Delete all FK rows with the given column_name (is_id == 'fk')."""
+    db.query(ColumnDef).filter(
+        ColumnDef.column_name == column_name,
+        ColumnDef.is_id == "fk",
+    ).delete(synchronize_session=False)
+    db.commit()
 
 
 @router.put("/column-defs/{item_id}")
