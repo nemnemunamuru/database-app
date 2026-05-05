@@ -1,4 +1,8 @@
 erDiagram
+    CIRCLE_PARAMETER {
+        uuid main_trajectory_type_parameter_id PK
+    }
+
     DOE {
         uuid doe_id PK
         string manufacturer
@@ -8,10 +12,15 @@ erDiagram
         string remarks
     }
 
+    EIGHT_PARAMETER {
+        uuid sub_trajectory_type_parameter_id PK
+    }
+
     EXPERIMENT {
         uuid experiment_id PK
-        datetime created_datetime
+        uuid project_id FK
         datetime updated_datetime
+        datetime created_datetime
         uuid galvano_system_id FK
         uuid welding_condition_id FK
         uuid experiment_material_id FK
@@ -20,7 +29,6 @@ erDiagram
         uuid observation_id FK
         uuid file_id FK
         string remarks
-        uuid project_id FK
     }
 
     EXPERIMENT_MATERIAL {
@@ -134,14 +142,19 @@ erDiagram
     PROJECT {
         uuid project_id PK
         string project_name
+        string remarks
+    }
+
+    RASTER_PARAMETER {
+        uuid sub_trajectory_type_parameter_id PK
     }
 
     RESULT {
         uuid result_id PK
         string oct_depth_mm
-        string oct_surface_csv_path
-        string oct_depth_csv_path
-        string oct_result_csv_path
+        path oct_surface_csv_path
+        path oct_depth_csv_path
+        path oct_result_csv_path
         float cross_section_depth_mm
         boolean spatter_flag
         float gap_opening_mm
@@ -167,6 +180,10 @@ erDiagram
         float nozzle_distance_mm
         float nozzle_angle_deg
         string remarks
+    }
+
+    SPIRAL_PARAMETER {
+        uuid main_trajectory_type_parameter_id PK
     }
 
     SUB_TRAJECTORY {
@@ -204,23 +221,27 @@ erDiagram
         string remarks
     }
 
-    EXPERIMENT }o--|| GALVANO_SYSTEM : ""
-    EXPERIMENT }o--|| WELDING_CONDITION : ""
-    EXPERIMENT }o--|| EXPERIMENT_MATERIAL : ""
-    EXPERIMENT }o--|| SHIELDING_CONDITION : ""
-    EXPERIMENT }o--|| RESULT : ""
-    EXPERIMENT }o--|| OBSERVATION : ""
-    EXPERIMENT }o--|| FILE : ""
-    EXPERIMENT }o--|| PROJECT : ""
-    EXPERIMENT_MATERIAL }o--|| MATERIAL_STATE : ""
-    GALVANO_SYSTEM }o--|| FTHETA : ""
-    GALVANO_SYSTEM }o--|| OPTICS : ""
-    LASER_DEVICE }o--|| LASER_BEAM : ""
-    MAIN_TRAJECTORY }o--|| LINE_PARAMETER : ""
-    MATERIAL_STATE }o--|| MATERIAL : ""
-    OPTICS }o--|| LASER_DEVICE : ""
-    OPTICS }o--|| DOE : ""
-    SUB_TRAJECTORY }o--|| WOBBLING_PARAMETER : ""
-    TRAJECTORY_SET }o--|| MAIN_TRAJECTORY : ""
-    TRAJECTORY_SET }o--|| SUB_TRAJECTORY : ""
-    WELDING_CONDITION }o--|| TRAJECTORY_SET : ""
+    EXPERIMENT }o--|| PROJECT : "ref"
+    EXPERIMENT }o--|| GALVANO_SYSTEM : "ref"
+    EXPERIMENT }o--|| WELDING_CONDITION : "ref"
+    EXPERIMENT }o--|| EXPERIMENT_MATERIAL : "ref"
+    EXPERIMENT }o--|| SHIELDING_CONDITION : "ref"
+    EXPERIMENT }o--|| RESULT : "ref"
+    EXPERIMENT }o--|| OBSERVATION : "ref"
+    EXPERIMENT }o--|| FILE : "ref"
+    EXPERIMENT_MATERIAL }o--|| MATERIAL_STATE : "ref"
+    GALVANO_SYSTEM }o--|| FTHETA : "ref"
+    GALVANO_SYSTEM }o--|| OPTICS : "ref"
+    LASER_DEVICE }o--|| LASER_BEAM : "ref"
+    MAIN_TRAJECTORY }o--|| CIRCLE_PARAMETER : "ref"
+    MAIN_TRAJECTORY }o--|| LINE_PARAMETER : "ref"
+    MAIN_TRAJECTORY }o--|| SPIRAL_PARAMETER : "ref"
+    MATERIAL_STATE }o--|| MATERIAL : "ref"
+    OPTICS }o--|| LASER_DEVICE : "ref"
+    OPTICS }o--|| DOE : "ref"
+    SUB_TRAJECTORY }o--|| EIGHT_PARAMETER : "ref"
+    SUB_TRAJECTORY }o--|| RASTER_PARAMETER : "ref"
+    SUB_TRAJECTORY }o--|| WOBBLING_PARAMETER : "ref"
+    TRAJECTORY_SET }o--|| MAIN_TRAJECTORY : "ref"
+    TRAJECTORY_SET }o--|| SUB_TRAJECTORY : "ref"
+    WELDING_CONDITION }o--|| TRAJECTORY_SET : "ref"

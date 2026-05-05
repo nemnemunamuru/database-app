@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { Box, Chip, Divider, Tab, Tabs, Typography } from "@mui/material";
 import { EntityCrud } from "../components/masters/EntityCrud";
 import type { FieldDef, TItem } from "../components/masters/EntityCrud";
@@ -15,66 +15,21 @@ import {
   galvanoSystemDetail, laserDeviceDetail, opticsDetail,
   trajectorySetDetail,
   masterProjectsApi,
+  trajectoryTypeDefsApi, dynParamsApi,
+  columnDefsTableApi,
 } from "../api/masters";
+import type { TrajectoryTypeDef } from "../api/masters";
+import {
+  buildGalvanoSystemChildren,
+  buildLaserDeviceItem,
+  f, fDate,
+} from "../components/common/detailTreeBuilders";
 
-// ── Tree builder helpers ──────────────────────────────────────────────────────
-const f = (v: any, unit = "") => (v != null ? `${v}${unit}` : "—");
+// ── Per-entity tree builders ──────────────────────────────────────────────────
 
 async function buildGalvanoTree(item: any): Promise<TItem[]> {
   const { data: d } = await galvanoSystemDetail(item.galvano_system_id);
-  const nodes: TItem[] = [
-    { label: "galvano_type",     value: f(d.galvano_type) },
-    { label: "serial_number",    value: f(d.serial_number) },
-    { label: "main_diameter_um", value: f(d.main_diameter_um, " µm") },
-    { label: "sub_diameter_um",  value: f(d.sub_diameter_um, " µm") },
-    { label: "oct_diameter_um",  value: f(d.oct_diameter_um, " µm") },
-    { label: "remarks",          value: f(d.remarks) },
-  ];
-  if (d.ftheta) {
-    nodes.push({ label: "FTHETA", children: [
-      { label: "manufacturer",    value: f(d.ftheta.manufacturer) },
-      { label: "model_name",      value: f(d.ftheta.model_name) },
-      { label: "ftheta_focal_mm", value: f(d.ftheta.ftheta_focal_mm, " mm") },
-    ]});
-  }
-  (d.optics ?? []).forEach((oe: any) => {
-    const opticsKids: TItem[] = [
-      { label: "optics_role",         value: f(oe.optics_role) },
-      { label: "manufacturer",        value: f(oe.manufacturer) },
-      { label: "collimator_focal_mm", value: f(oe.collimator_focal_mm, " mm") },
-      { label: "serial_number",       value: f(oe.serial_number) },
-    ];
-    if (oe.doe) {
-      opticsKids.push({ label: "DOE", children: [
-        { label: "manufacturer",  value: f(oe.doe.manufacturer) },
-        { label: "model_name",    value: f(oe.doe.model_name) },
-        { label: "profile_shape", value: f(oe.doe.profile_shape) },
-      ]});
-    }
-    if (oe.laser_device) {
-      const ld = oe.laser_device;
-      const ldKids: TItem[] = [
-        { label: "manufacturer",   value: f(ld.manufacturer) },
-        { label: "model_name",     value: f(ld.model_name) },
-        { label: "beam_structure", value: f(ld.beam_structure) },
-      ];
-      (ld.laser_beams ?? []).forEach((lb: any) => {
-        ldKids.push({
-          label: f(lb.beam_type),
-          children: [
-            { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
-            { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
-            { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
-            { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
-            { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
-          ],
-        });
-      });
-      opticsKids.push({ label: "LASER_DEVICE", children: ldKids });
-    }
-    nodes.push({ label: "OPTICS", children: opticsKids });
-  });
-  return nodes;
+  return buildGalvanoSystemChildren(d);
 }
 
 async function buildLaserDeviceTree(item: any): Promise<TItem[]> {
@@ -86,9 +41,10 @@ async function buildLaserDeviceTree(item: any): Promise<TItem[]> {
     { label: "beam_structure", value: f(d.beam_structure) },
     { label: "remarks",        value: f(d.remarks) },
   ];
+  // Standalone view includes extra beam fields (m2_value, bpp_mm_mrad)
   (d.laser_beams ?? []).forEach((lb: any) => {
     nodes.push({
-      label: f(lb.beam_type),
+      label: lb.beam_type ?? "—",
       children: [
         { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
         { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
@@ -105,6 +61,7 @@ async function buildLaserDeviceTree(item: any): Promise<TItem[]> {
 
 async function buildOpticsTree(item: any): Promise<TItem[]> {
   const { data: d } = await opticsDetail(item._id);
+  // Standalone OPTICS view: show optics_role as a value field
   const nodes: TItem[] = [
     { label: "optics_role",         value: f(d.optics_role) },
     { label: "manufacturer",        value: f(d.manufacturer) },
@@ -112,34 +69,17 @@ async function buildOpticsTree(item: any): Promise<TItem[]> {
     { label: "serial_number",       value: f(d.serial_number) },
     { label: "remarks",             value: f(d.remarks) },
   ];
-  if (d.laser_device) {
-    const ld = d.laser_device;
-    const ldKids: TItem[] = [
-      { label: "manufacturer",   value: f(ld.manufacturer) },
-      { label: "model_name",     value: f(ld.model_name) },
-      { label: "beam_structure", value: f(ld.beam_structure) },
-    ];
-    (ld.laser_beams ?? []).forEach((lb: any) => {
-      ldKids.push({
-        label: f(lb.beam_type),
-        children: [
-          { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
-          { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
-          { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
-          { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
-          { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
-        ],
-      });
-    });
-    nodes.push({ label: "LASER_DEVICE", children: ldKids });
-  }
-  if (d.doe) {
-    nodes.push({ label: "DOE", children: [
+  if (d.doe) nodes.push({
+    label: "DOE",
+    children: [
       { label: "manufacturer",  value: f(d.doe.manufacturer) },
       { label: "model_name",    value: f(d.doe.model_name) },
+      { label: "serial_number", value: f(d.doe.serial_number) },
       { label: "profile_shape", value: f(d.doe.profile_shape) },
-    ]});
-  }
+      { label: "remarks",       value: f(d.doe.remarks) },
+    ],
+  });
+  if (d.laser_device) nodes.push(buildLaserDeviceItem(d.laser_device));
   return nodes;
 }
 
@@ -395,7 +335,7 @@ async function buildResultTree(item: any): Promise<TItem[]> {
 async function buildObservationTree(item: any): Promise<TItem[]> {
   return [
     { label: "observer_name",        value: f(item.observer_name) },
-    { label: "observation_datetime", value: f(item.observation_datetime) },
+    { label: "observation_datetime", value: fDate(item.observation_datetime) },
     { label: "comment",              value: f(item.comment) },
     { label: "remarks",              value: f(item.remarks) },
   ];
@@ -475,7 +415,7 @@ async function buildExperimentTree(item: any): Promise<TItem[]> {
   ]);
   await resolveFK(item.observation_id, observationsApi, "OBSERVATION", (d) => [
     { label: "observer_name",        value: f(d.observer_name) },
-    { label: "observation_datetime", value: f(d.observation_datetime) },
+    { label: "observation_datetime", value: fDate(d.observation_datetime) },
     { label: "comment",              value: f(d.comment) },
   ]);
   return nodes;
@@ -515,7 +455,7 @@ const LASER_DEVICE_FIELDS: FieldDef[] = [
   { key: "remarks", label: "remarks", type: "text" },
 ];
 
-// LASER_BEAM フラットビュー（1行 = 1エントリ，複合PK: laser_beam_id + beam_type）
+// LASER_BEAM flat view (1 row = 1 entry, composite PK: laser_beam_id + beam_type)
 const LASER_BEAM_COMBINED_FIELDS: FieldDef[] = [
   { key: "laser_beam_id",      label: "laser_beam_id",      type: "text" },
   { key: "beam_type", label: "beam_type", type: "text" },
@@ -537,7 +477,7 @@ const FTHETA_FIELDS: FieldDef[] = [
   { key: "remarks",         label: "remarks",         type: "text" },
 ];
 
-// OPTICS フラットビュー（1行 = 1エントリ，複合PK: optics_id + optics_role）
+// OPTICS flat view (1 row = 1 entry, composite PK: optics_id + optics_role)
 const OPTICS_COMBINED_FIELDS: FieldDef[] = [
   { key: "optics_id",           label: "optics_id",           type: "text" },
   { key: "optics_role", label: "optics_role", type: "text" },
@@ -689,7 +629,6 @@ const FILE_FIELDS: FieldDef[] = [
 ];
 
 const PROJECT_FIELDS: FieldDef[] = [
-  { key: "project_id",   label: "project_id",   type: "text", hideInTable: true },
   { key: "project_name", label: "project_name", type: "text" },
 ];
 
@@ -697,6 +636,7 @@ async function buildProjectTree(item: any): Promise<TItem[]> {
   return [
     { label: "project_id",   value: f(item.project_id) },
     { label: "project_name", value: f(item.project_name) },
+    { label: "remarks",      value: f(item.remarks) },
   ];
 }
 
@@ -761,6 +701,34 @@ const COLUMN_DEF_FIELDS: FieldDef[] = [
   { key: "candidates",  label: "candidates",  type: "text" },
 ];
 
+// ── Dynamic trajectory parameter table CRUD ───────────────────────────────────
+function DynParamCrud({ title, slug, pkCol }: { title: string; slug: string; pkCol: string }) {
+  const tableUpper = slug.replace(/-/g, "_").toUpperCase();
+  const [fields, setFields] = useState<FieldDef[]>([{ key: "remarks", label: "remarks", type: "text" }]);
+  useEffect(() => {
+    columnDefsTableApi(tableUpper).list().then(r => {
+      const defs = (r.data as any[]).filter(c => c.is_id !== "pk" && c.is_id !== "fk");
+      if (defs.length) {
+        setFields(defs.map((c: any) => ({
+          key: c.column_name,
+          label: c.column_name + (c.unit ? ` [${c.unit}]` : ""),
+          type: c.data_type === "float" || c.data_type === "integer" ? "number" : "text",
+        })));
+      }
+    }).catch(() => {});
+  }, [tableUpper]);
+
+  const api = dynParamsApi(slug);
+  return (
+    <EntityCrud
+      title={title}
+      fields={fields}
+      pkField={pkCol}
+      api={{ list: api.list, create: api.create, update: api.update, remove: api.remove }}
+    />
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function MasterPage() {
@@ -768,6 +736,18 @@ export default function MasterPage() {
   const [subTab0, setSubTab0] = useState(0); // GALVANO_SYSTEM sub-tabs
   const [subTab1, setSubTab1] = useState(0); // WELDING_CONDITION sub-tabs
   const [subTab2, setSubTab2] = useState(0); // EXPERIMENT_MATERIAL sub-tabs
+  const [trajectoryTypeDefs, setTrajectoryTypeDefs] = useState<TrajectoryTypeDef[]>([]);
+
+  useEffect(() => {
+    trajectoryTypeDefsApi.sync().then(() =>
+      trajectoryTypeDefsApi.list().then(r => setTrajectoryTypeDefs(r.data))
+    ).catch(() => trajectoryTypeDefsApi.list().then(r => setTrajectoryTypeDefs(r.data)).catch(() => {}));
+  }, []);
+
+  // Stable references for candidatesTables arrays to prevent spurious useEffect re-runs
+  const galvanoCandidates  = useMemo(() => ["OPTICS", "LASER_BEAM"], []);
+  const opticsCandidates   = useMemo(() => ["LASER_BEAM", "DOE"], []);
+  const laserDevCandidates = useMemo(() => ["LASER_BEAM"], []);
 
   return (
     <Box>
@@ -782,11 +762,11 @@ export default function MasterPage() {
         <Tab label="FILE"                 sx={{ color: "#37474f", fontWeight: 700, '&.Mui-selected': { color: "#37474f" } }} />
       </Tabs>
 
-      {tab === 0 && (
+      <Box sx={{ display: tab === 0 ? "" : "none" }}>
         <EntityCrud title="PROJECT" fields={PROJECT_FIELDS} pkField="project_id" api={masterProjectsApi} expandable buildTree={buildProjectTree} />
-      )}
+      </Box>
 
-      {tab === 1 && (
+      <Box sx={{ display: tab === 1 ? "" : "none" }}>
         <Box>
           <Tabs value={subTab0} onChange={(_, v) => setSubTab0(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
             <Tab label="GALVANO_SYSTEM" />
@@ -796,62 +776,90 @@ export default function MasterPage() {
             <Tab label="LASER_BEAM" />
             <Tab label="DOE" />
           </Tabs>
-          {subTab0 === 0 && <EntityCrud title="GALVANO_SYSTEM" fields={GALVANO_FIELDS} pkField="galvano_system_id" api={galvanoSystemsApi} expandable buildTree={buildGalvanoTree} />}
-          {subTab0 === 1 && <EntityCrud title="FTHETA" fields={FTHETA_FIELDS} pkField="ftheta_id" api={fthetaApi} expandable buildTree={buildFthetaTree} />}
-          {subTab0 === 2 && <EntityCrud title="OPTICS" fields={OPTICS_COMBINED_FIELDS} pkField="_id" api={opticsApi} expandable buildTree={buildOpticsTree} />}
-          {subTab0 === 3 && <EntityCrud title="LASER_DEVICE" fields={LASER_DEVICE_FIELDS} pkField="laser_device_id" api={laserDevicesApi} expandable buildTree={buildLaserDeviceTree} />}
-          {subTab0 === 4 && <EntityCrud title="LASER_BEAM" fields={LASER_BEAM_COMBINED_FIELDS} pkField="_id" api={laserBeamsApi} expandable buildTree={buildLaserBeamCombinedTree} />}
-          {subTab0 === 5 && <EntityCrud title="DOE" fields={DOE_FIELDS} pkField="doe_id" api={doeApi} expandable buildTree={buildDoeTree} />}
+          <Box sx={{ display: subTab0 === 0 ? "" : "none" }}><EntityCrud title="GALVANO_SYSTEM" fields={GALVANO_FIELDS} pkField="galvano_system_id" api={galvanoSystemsApi} expandable buildTree={buildGalvanoTree} candidatesTables={galvanoCandidates} /></Box>
+          <Box sx={{ display: subTab0 === 1 ? "" : "none" }}><EntityCrud title="FTHETA" fields={FTHETA_FIELDS} pkField="ftheta_id" api={fthetaApi} expandable buildTree={buildFthetaTree} /></Box>
+          <Box sx={{ display: subTab0 === 2 ? "" : "none" }}><EntityCrud title="OPTICS" fields={OPTICS_COMBINED_FIELDS} pkField="_id" api={opticsApi} expandable buildTree={buildOpticsTree} candidatesTables={opticsCandidates} /></Box>
+          <Box sx={{ display: subTab0 === 3 ? "" : "none" }}><EntityCrud title="LASER_DEVICE" fields={LASER_DEVICE_FIELDS} pkField="laser_device_id" api={laserDevicesApi} expandable buildTree={buildLaserDeviceTree} candidatesTables={laserDevCandidates} /></Box>
+          <Box sx={{ display: subTab0 === 4 ? "" : "none" }}><EntityCrud title="LASER_BEAM" fields={LASER_BEAM_COMBINED_FIELDS} pkField="_id" api={laserBeamsApi} expandable buildTree={buildLaserBeamCombinedTree} /></Box>
+          <Box sx={{ display: subTab0 === 5 ? "" : "none" }}><EntityCrud title="DOE" fields={DOE_FIELDS} pkField="doe_id" api={doeApi} expandable buildTree={buildDoeTree} /></Box>
         </Box>
-      )}
+      </Box>
 
-      {tab === 2 && (
+      <Box sx={{ display: tab === 2 ? "" : "none" }}>
         <Box>
-          <Tabs value={subTab1} onChange={(_, v) => setSubTab1(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
+          {/* Static + dynamic trajectory parameter tabs */}
+          <Tabs value={subTab1} onChange={(_, v) => setSubTab1(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons allowScrollButtonsMobile>
             <Tab label="WELDING_CONDITION" />
             <Tab label="TRAJECTORY_SET" />
             <Tab label="MAIN_TRAJECTORY" />
-            <Tab label="LINE_PARAMETER" />
+            {/* Dynamic main trajectory parameter tabs */}
+            {trajectoryTypeDefs.filter(d => d.parent === "main").map(d => (
+              <Tab key={d.type_def_id} label={d.param_table.toUpperCase()} />
+            ))}
             <Tab label="SUB_TRAJECTORY" />
-            <Tab label="WOBBLING_PARAMETER" />
+            {/* Dynamic sub trajectory parameter tabs */}
+            {trajectoryTypeDefs.filter(d => d.parent === "sub").map(d => (
+              <Tab key={d.type_def_id} label={d.param_table.toUpperCase()} />
+            ))}
           </Tabs>
-          {subTab1 === 0 && <EntityCrud title="WELDING_CONDITION" fields={WELDING_FIELDS} pkField="welding_condition_id" api={weldingConditionsApi} expandable buildTree={buildWeldingTree} />}
-          {subTab1 === 1 && <EntityCrud title="TRAJECTORY_SET" fields={TRAJECTORY_SET_FIELDS} pkField="trajectory_set_id" api={trajectorySetsApi} expandable buildTree={buildTrajectorySetTree} />}
-          {subTab1 === 2 && <EntityCrud title="MAIN_TRAJECTORY" fields={MAIN_TRAJECTORY_FIELDS} pkField="main_trajectory_id" api={mainTrajectoriesApi} expandable buildTree={buildMainTrajectoryTree} />}
-          {subTab1 === 3 && <EntityCrud title="LINE_PARAMETER" fields={LINE_PARAMETER_FIELDS} pkField="main_trajectory_type_parameter_id" api={lineParametersApi} expandable buildTree={buildLineParameterTree} />}
-          {subTab1 === 4 && <EntityCrud title="SUB_TRAJECTORY" fields={SUB_TRAJECTORY_FIELDS} pkField="sub_trajectory_id" api={subTrajectoriesApi} expandable buildTree={buildSubTrajectoryTree} />}
-          {subTab1 === 5 && <EntityCrud title="WOBBLING_PARAMETER" fields={WOBBLING_PARAMETER_FIELDS} pkField="sub_trajectory_type_parameter_id" api={wobblingParametersApi} expandable buildTree={buildWobblingParameterTree} />}
+          <Box sx={{ display: subTab1 === 0 ? "" : "none" }}><EntityCrud title="WELDING_CONDITION" fields={WELDING_FIELDS} pkField="welding_condition_id" api={weldingConditionsApi} expandable buildTree={buildWeldingTree} /></Box>
+          <Box sx={{ display: subTab1 === 1 ? "" : "none" }}><EntityCrud title="TRAJECTORY_SET" fields={TRAJECTORY_SET_FIELDS} pkField="trajectory_set_id" api={trajectorySetsApi} expandable buildTree={buildTrajectorySetTree} /></Box>
+          <Box sx={{ display: subTab1 === 2 ? "" : "none" }}><EntityCrud title="MAIN_TRAJECTORY" fields={MAIN_TRAJECTORY_FIELDS} pkField="main_trajectory_id" api={mainTrajectoriesApi} expandable buildTree={buildMainTrajectoryTree} /></Box>
+          {/* Dynamic main parameter tabs */}
+          {trajectoryTypeDefs.filter(d => d.parent === "main").map((d, i) => {
+            const tabIdx = 3 + i;
+            const slug = d.param_table.replace(/_/g, "-");
+            return (
+              <Box key={d.type_def_id} sx={{ display: subTab1 === tabIdx ? "" : "none" }}>
+                <DynParamCrud title={d.param_table.toUpperCase()} slug={slug} pkCol={d.pk_col} />
+              </Box>
+            );
+          })}
+          {/* SUB_TRAJECTORY tab */}
+          <Box sx={{ display: subTab1 === 3 + trajectoryTypeDefs.filter(d => d.parent === "main").length ? "" : "none" }}>
+            <EntityCrud title="SUB_TRAJECTORY" fields={SUB_TRAJECTORY_FIELDS} pkField="sub_trajectory_id" api={subTrajectoriesApi} expandable buildTree={buildSubTrajectoryTree} />
+          </Box>
+          {/* Dynamic sub parameter tabs */}
+          {trajectoryTypeDefs.filter(d => d.parent === "sub").map((d, i) => {
+            const tabIdx = 4 + trajectoryTypeDefs.filter(x => x.parent === "main").length + i;
+            const slug = d.param_table.replace(/_/g, "-");
+            return (
+              <Box key={d.type_def_id} sx={{ display: subTab1 === tabIdx ? "" : "none" }}>
+                <DynParamCrud title={d.param_table.toUpperCase()} slug={slug} pkCol={d.pk_col} />
+              </Box>
+            );
+          })}
         </Box>
-      )}
+      </Box>
 
-      {tab === 3 && (
+      <Box sx={{ display: tab === 3 ? "" : "none" }}>
         <Box>
           <Tabs value={subTab2} onChange={(_, v) => setSubTab2(v)} sx={{ mb: 2 }} variant="scrollable" scrollButtons="auto">
             <Tab label="EXPERIMENT_MATERIAL" />
             <Tab label="MATERIAL_STATE" />
             <Tab label="MATERIAL" />
           </Tabs>
-          {subTab2 === 0 && <EntityCrud title="EXPERIMENT_MATERIAL" fields={EXPERIMENT_MATERIAL_FIELDS} pkField="experiment_material_id" api={experimentMaterialsApi} expandable buildTree={buildExperimentMaterialTree} />}
-          {subTab2 === 1 && <EntityCrud title="MATERIAL_STATE" fields={MATERIAL_STATE_FIELDS} pkField="material_state_id" api={materialStatesApi} expandable buildTree={buildMaterialStateTree} />}
-          {subTab2 === 2 && <EntityCrud title="MATERIAL" fields={MATERIAL_FIELDS} pkField="material_id" api={materialsApi} expandable buildTree={buildMaterialTree} />}
+          <Box sx={{ display: subTab2 === 0 ? "" : "none" }}><EntityCrud title="EXPERIMENT_MATERIAL" fields={EXPERIMENT_MATERIAL_FIELDS} pkField="experiment_material_id" api={experimentMaterialsApi} expandable buildTree={buildExperimentMaterialTree} /></Box>
+          <Box sx={{ display: subTab2 === 1 ? "" : "none" }}><EntityCrud title="MATERIAL_STATE" fields={MATERIAL_STATE_FIELDS} pkField="material_state_id" api={materialStatesApi} expandable buildTree={buildMaterialStateTree} /></Box>
+          <Box sx={{ display: subTab2 === 2 ? "" : "none" }}><EntityCrud title="MATERIAL" fields={MATERIAL_FIELDS} pkField="material_id" api={materialsApi} expandable buildTree={buildMaterialTree} /></Box>
         </Box>
-      )}
+      </Box>
 
-      {tab === 4 && (
+      <Box sx={{ display: tab === 4 ? "" : "none" }}>
         <EntityCrud title="SHIELDING_CONDITION" fields={SHIELDING_FIELDS} pkField="shielding_condition_id" api={shieldingConditionsApi} expandable buildTree={buildShieldingTree} />
-      )}
+      </Box>
 
-      {tab === 5 && (
+      <Box sx={{ display: tab === 5 ? "" : "none" }}>
         <EntityCrud title="RESULT" fields={RESULT_FIELDS} pkField="result_id" api={resultsApi} expandable buildTree={buildResultTree} />
-      )}
+      </Box>
 
-      {tab === 6 && (
+      <Box sx={{ display: tab === 6 ? "" : "none" }}>
         <EntityCrud title="OBSERVATION" fields={OBSERVATION_FIELDS} pkField="observation_id" api={observationsApi} expandable buildTree={buildObservationTree} />
-      )}
+      </Box>
 
-      {tab === 7 && (
+      <Box sx={{ display: tab === 7 ? "" : "none" }}>
         <EntityCrud title="FILE" fields={FILE_FIELDS} pkField="file_id" api={filesApi} expandable buildTree={buildFileTree} />
-      )}
+      </Box>
     </Box>
   );
 }

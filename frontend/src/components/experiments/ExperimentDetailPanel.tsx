@@ -8,20 +8,23 @@ import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import type { ExperimentDetail } from "../../api/experiments";
 import type { Candidate } from "../masters/EntityCrud";
+import {
+  BoolChip as _BoolChip,
+  buildGalvanoSystemSection,
+  buildWeldingConditionSection,
+  buildExperimentMaterialSection,
+  buildShieldingConditionSection,
+  buildResultSection,
+  buildObservationSection,
+  buildFileSection,
+  f as _f,
+} from "../common/detailTreeBuilders";
 
 // ── Tree types ────────────────────────────────────────────────────────────────
 export type TItem = { label: React.ReactNode; value?: React.ReactNode; children?: TItem[] };
 
-export const BoolChip = ({ v }: { v: boolean | null | undefined }) =>
-  v == null ? <>—</> : (
-    <Chip
-      label={v ? "Yes" : "No"}
-      size="small"
-      color={v ? "error" : "success"}
-      variant="outlined"
-      sx={{ height: 16, fontSize: 10, "& .MuiChip-label": { px: 0.5 } }}
-    />
-  );
+// Re-export BoolChip from shared location (keeps backward compat for any future imports)
+export const BoolChip = _BoolChip;
 
 export function filterTree(items: TItem[], hideEmpty: boolean): TItem[] {
   if (!hideEmpty) return items;
@@ -112,185 +115,73 @@ export function TreeBlock({ items, depth = 0, hideEmpty, candidatesMap = {} }: {
 
 // ── Detail panel ──────────────────────────────────────────────────────────────
 export function DetailPanel({
-  detail, onEdit, onClose, candidatesMap,
+  detail, onEdit, onClose, candidatesMap, extraExpCols = [], projectData,
 }: {
   detail: ExperimentDetail;
   onEdit: () => void;
   onClose: () => void;
   candidatesMap: Record<string, Candidate[]>;
+  /** Ordered list of non-PK column defs for the EXPERIMENT table (from column_defs). */
+  extraExpCols?: { column_name: string; is_id?: string }[];
+  /** Raw project object (all columns). When provided the PROJECT section is built dynamically. */
+  projectData?: Record<string, any>;
 }) {
   const [hideEmpty, setHideEmpty] = useState(false);
 
-  const f = (v: unknown, unit = "") => v != null ? `${v}${unit}` : null;
   const gs  = detail.galvano_system;
   const wc  = detail.welding_condition;
-  const em  = detail.experiment_material;
+  const emList = Array.isArray(detail.experiment_material) ? detail.experiment_material : (detail.experiment_material ? [detail.experiment_material] : []);
   const sc  = detail.shielding_condition;
   const res = detail.result;
   const obs = detail.observation;
   const fil = detail.file;
 
+  // Build PROJECT children dynamically from projectData (same loop-over-properties
+  // approach as EntityCrud.handleRowClick) or fall back to flat detail fields.
+  const projectChildren: TItem[] = (() => {
+    const src: Record<string, any> = projectData ?? {
+      project_id:   detail.project_id,
+      project_name: detail.project_name,
+      remarks:      (detail as any).project_remarks,
+    };
+    return Object.entries(src)
+      .filter(([key]) => !key.startsWith("_"))
+      .map(([key, val]) => ({ label: key, value: val != null ? String(val) : null }));
+  })();
+
   const sections: TItem[] = [
     {
       label: "PROJECT",
-      children: [
-        { label: "project_id",   value: f(detail.project_id) },
-        { label: "project_name", value: f(detail.project_name) },
-      ],
+      children: projectChildren,
     },
-    {
-      label: "GALVANO_SYSTEM",
-      children: gs ? [
-        { label: "galvano_type",     value: f(gs.galvano_type) },
-        { label: "serial_number",    value: f(gs.serial_number) },
-        { label: "main_diameter_um", value: f(gs.main_diameter_um, " µm") },
-        { label: "sub_diameter_um",  value: f(gs.sub_diameter_um, " µm") },
-        { label: "oct_diameter_um",  value: f(gs.oct_diameter_um, " µm") },
-        { label: "remarks",          value: f(gs.remarks) },
-        ...(gs.ftheta ? [{ label: "FTHETA", children: [
-          { label: "manufacturer",    value: f(gs.ftheta.manufacturer) },
-          { label: "model_name",      value: f(gs.ftheta.model_name) },
-          { label: "ftheta_focal_mm", value: f(gs.ftheta.ftheta_focal_mm, " mm") },
-        ]}] : []),
-        ...(gs.optics ?? []).map((oe: any) => ({ label: "OPTICS", children: [
-          { label: "optics_role",         value: f(oe.optics_role) },
-          { label: "manufacturer",        value: f(oe.manufacturer) },
-          { label: "collimator_focal_mm", value: f(oe.collimator_focal_mm, " mm") },
-          { label: "serial_number",       value: f(oe.serial_number) },
-          ...(oe.doe ? [{ label: "DOE", children: [
-            { label: "manufacturer",  value: f(oe.doe.manufacturer) },
-            { label: "model_name",    value: f(oe.doe.model_name) },
-            { label: "serial_number", value: f(oe.doe.serial_number) },
-            { label: "profile_shape", value: f(oe.doe.profile_shape) },
-            { label: "remarks",       value: f(oe.doe.remarks) },
-          ]}] : []),
-          ...(oe.laser_device ? [{ label: "LASER_DEVICE", children: [
-            { label: "manufacturer",   value: f(oe.laser_device.manufacturer) },
-            { label: "model_name",     value: f(oe.laser_device.model_name) },
-            { label: "serial_number",  value: f(oe.laser_device.serial_number) },
-            { label: "beam_structure", value: f(oe.laser_device.beam_structure) },
-            { label: "remarks",        value: f(oe.laser_device.remarks) },
-            ...(oe.laser_device.laser_beams ?? []).map((lb: any) => ({
-              label: f(lb.beam_type) ?? "—",
-              children: [
-                { label: "wavelength_nm",          value: f(lb.wavelength_nm, " nm") },
-                { label: "numerical_aperture",     value: f(lb.numerical_aperture) },
-                { label: "core_diameter_um",       value: f(lb.core_diameter_um, " µm") },
-                { label: "ring_inner_diameter_um", value: f(lb.ring_inner_diameter_um, " µm") },
-                { label: "ring_outer_diameter_um", value: f(lb.ring_outer_diameter_um, " µm") },
-              ],
-            })),
-          ]}] : []),
-        ]})),
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "WELDING_CONDITION",
-      children: wc ? [
-        { label: "main_power_w",         value: f(wc.main_power_w, " W") },
-        { label: "sub_power_w",          value: f(wc.sub_power_w, " W") },
-        { label: "welding_speed_mm_s",   value: f(wc.welding_speed_mm_s, " mm/s") },
-        { label: "main_focus_offset_mm", value: f(wc.main_focus_offset_mm, " mm") },
-        { label: "sub_focus_offset_mm",  value: f(wc.sub_focus_offset_mm, " mm") },
-        { label: "remarks",              value: f(wc.remarks) },
-        ...(wc.trajectory_set ? [{ label: "TRAJECTORY_SET", children: [
-          { label: "trajectory_csv_path", value: f(wc.trajectory_set.trajectory_csv_path) },
-          { label: "remarks",             value: f(wc.trajectory_set.remarks) },
-          ...(wc.trajectory_set.main_trajectory ? [{ label: "MAIN_TRAJECTORY", children: [
-            { label: "main_trajectory_type", value: f(wc.trajectory_set.main_trajectory.main_trajectory_type) },
-            { label: "remarks",              value: f(wc.trajectory_set.main_trajectory.remarks) },
-            ...(wc.trajectory_set.main_trajectory.line_parameter ? [{ label: "LINE_PARAMETER", children: [
-              { label: "length_mm", value: f(wc.trajectory_set.main_trajectory.line_parameter.length_mm, " mm") },
-              { label: "remarks",   value: f(wc.trajectory_set.main_trajectory.line_parameter.remarks) },
-            ]}] : []),
-          ]}] : []),
-          ...(wc.trajectory_set.sub_trajectory ? [{ label: "SUB_TRAJECTORY", children: [
-            { label: "sub_trajectory_type", value: f(wc.trajectory_set.sub_trajectory.sub_trajectory_type) },
-            { label: "remarks",             value: f(wc.trajectory_set.sub_trajectory.remarks) },
-            ...(wc.trajectory_set.sub_trajectory.wobbling_parameter ? [{ label: "WOBBLING_PARAMETER", children: [
-              { label: "wobble_radius_mm",      value: f(wc.trajectory_set.sub_trajectory.wobbling_parameter.wobble_radius_mm, " mm") },
-              { label: "wobble_frequency_hz",   value: f(wc.trajectory_set.sub_trajectory.wobbling_parameter.wobble_frequency_hz, " Hz") },
-              { label: "circumferential_speed", value: f(wc.trajectory_set.sub_trajectory.wobbling_parameter.circumferential_speed) },
-              { label: "remarks",               value: f(wc.trajectory_set.sub_trajectory.wobbling_parameter.remarks) },
-            ]}] : []),
-          ]}] : []),
-        ]}] : []),
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "EXPERIMENT_MATERIAL",
-      children: em ? [
-        { label: "material_role", value: f(em.material_role) },
-        { label: "remarks",       value: f(em.remarks) },
-        ...(em.material_state ? [{ label: "MATERIAL_STATE", children: [
-          { label: "thickness_mm",      value: f(em.material_state.thickness_mm, " mm") },
-          { label: "width_mm",          value: f(em.material_state.width_mm, " mm") },
-          { label: "length_mm",         value: f(em.material_state.length_mm, " mm") },
-          { label: "surface_condition", value: f(em.material_state.surface_condition) },
-          { label: "remarks",           value: f(em.material_state.remarks) },
-          ...(em.material_state.material ? [{ label: "MATERIAL", children: [
-            { label: "material_name",             value: f(em.material_state.material.material_name) },
-            { label: "material_class",            value: f(em.material_state.material.material_class) },
-            { label: "density_kg_m3",             value: f(em.material_state.material.density_kg_m3, " kg/m³") },
-            { label: "thermal_conductivity_w_mk", value: f(em.material_state.material.thermal_conductivity_w_mk, " W/mK") },
-            { label: "reflectivity_1070nm",       value: f(em.material_state.material.reflectivity_1070nm) },
-            { label: "remarks",                   value: f(em.material_state.material.remarks) },
-          ]}] : []),
-        ]}] : []),
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "SHIELDING_CONDITION",
-      children: sc ? [
-        { label: "gas_type",            value: f(sc.gas_type) },
-        { label: "gas_purity_percent",  value: f(sc.gas_purity_percent, " %") },
-        { label: "gas_flow_l_min",      value: f(sc.gas_flow_l_min, " L/min") },
-        { label: "gas_pressure_kpa",    value: f(sc.gas_pressure_kpa, " kPa") },
-        { label: "nozzle_type",         value: f(sc.nozzle_type) },
-        { label: "nozzle_diameter_mm",  value: f(sc.nozzle_diameter_mm, " mm") },
-        { label: "nozzle_distance_mm",  value: f(sc.nozzle_distance_mm, " mm") },
-        { label: "nozzle_angle_deg",    value: f(sc.nozzle_angle_deg, "°") },
-        { label: "remarks",             value: f(sc.remarks) },
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "RESULT",
-      children: res ? [
-        { label: "oct_depth_mm",           value: f(res.oct_depth_mm, " mm") },
-        { label: "oct_surface_csv_path",   value: f(res.oct_surface_csv_path) },
-        { label: "oct_depth_csv_path",     value: f(res.oct_depth_csv_path) },
-        { label: "oct_result_csv_path",    value: f(res.oct_result_csv_path) },
-        { label: "cross_section_depth_mm", value: f(res.cross_section_depth_mm, " mm") },
-        { label: "spatter_flag",           value: <BoolChip v={res.spatter_flag} /> },
-        { label: "spatter_severity",       value: f(res.spatter_severity) },
-        { label: "gap_opening_flag",       value: <BoolChip v={res.gap_opening_flag} /> },
-        { label: "crack_flag",             value: <BoolChip v={res.crack_flag} /> },
-        { label: "crack_severity",         value: f(res.crack_severity) },
-        { label: "glass_contamination",    value: <BoolChip v={res.glass_contamination} /> },
-        { label: "surface_contamination",  value: <BoolChip v={res.surface_contamination} /> },
-        { label: "penetration_flag",       value: <BoolChip v={res.penetration_flag} /> },
-        { label: "remarks",                value: f(res.remarks) },
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "OBSERVATION",
-      children: obs ? [
-        { label: "observer_name",        value: f(obs.observer_name) },
-        { label: "observation_datetime", value: f(obs.observation_datetime) },
-        { label: "comment",              value: f(obs.comment) },
-        { label: "remarks",              value: f(obs.remarks) },
-      ] : [{ label: "(not set)", value: "" }],
-    },
-    {
-      label: "FILE",
-      children: fil ? [
-        { label: "remarks", value: f(fil.remarks) },
-      ] : [{ label: "(not set)", value: "" }],
-    },
+    buildGalvanoSystemSection(gs),
+    buildWeldingConditionSection(wc),
+    buildExperimentMaterialSection(emList),
+    buildShieldingConditionSection(sc),
+    buildResultSection(res),
+    buildObservationSection(obs),
+    buildFileSection(fil),
   ];
 
+  // Append dynamic EXPERIMENT columns (from Settings) that aren't already shown
+  const staticExpKeys = new Set([
+    "experiment_id", "galvano_system_id", "welding_condition_id", "experiment_material_id",
+    "shielding_condition_id", "result_id", "observation_id", "file_id",
+    "project_id", "project_name", "project_remarks", "remarks",
+    "created_datetime", "updated_datetime",
+    "galvano_system", "welding_condition", "experiment_material",
+    "shielding_condition", "result", "observation", "file",
+  ]);
+  const dynamicExpItems: TItem[] = extraExpCols
+    .filter(c => c.is_id !== "pk" && !staticExpKeys.has(c.column_name))
+    .map(c => ({ label: c.column_name, value: _f((detail as any)[c.column_name]) }))
+    .filter(item => item.value != null);
+  if (dynamicExpItems.length > 0) {
+    sections.push({ label: "EXPERIMENT (custom)", children: dynamicExpItems });
+  }
+
   return (
-    <Paper elevation={3} sx={{ position: "sticky", top: 8, maxHeight: "calc(100vh - 180px)", overflow: "auto", p: 1.5, minWidth: 300 }}>
+    <Paper elevation={3} sx={{ p: 1.5, minWidth: 300 }}>
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
         <Typography variant="caption" fontFamily="monospace" fontSize={10} color="text.secondary" noWrap sx={{ maxWidth: 180 }}>
           {detail.experiment_id}

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Accordion, AccordionDetails, AccordionSummary,
-  Alert, Box, Button, Checkbox, CircularProgress, Collapse, Dialog,
+  Alert, Box, Button, Checkbox, CircularProgress, Dialog,
   DialogActions, DialogContent, DialogTitle, Divider,
   FormControlLabel, FormGroup,
   IconButton, List, ListItemButton, ListItemText,
@@ -25,9 +25,17 @@ import { projectsApi } from "../api/projects";
 import { fetchExperiments, fetchExperimentProjects } from "../api/experiments";
 import type { Experiment, ExperimentDetail } from "../api/experiments";
 import ExpDeepEditDialog from "../components/projects/ExpDeepEditDialog";
+import MergeDiffDialog from "../components/projects/MergeDiffDialog";
+import type { ConflictItem } from "../components/projects/MergeDiffDialog";
 import { DetailPanel } from "../components/experiments/ExperimentDetailPanel";
 import { columnDefsTableApi } from "../api/masters";
 import type { Candidate } from "../components/masters/EntityCrud";
+import ExperimentFilterBar from "../components/common/ExperimentFilterBar";
+import {
+  type FilterState,
+  FILTER_DEFAULT,
+  matchDeep,
+} from "../utils/experimentFilter";
 
 // ── 2-step Load by Name dialog ────────────────────────────────────────────────
 function LoadByNameDialog({ open, onClose, onSelect }: {
@@ -47,7 +55,7 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
       .finally(() => setLoading(false));
   }, [open]);
 
-  const NAME_NONE = "（名称なし）";
+  const NAME_NONE = "(no name)";
   const getName = (e: Experiment) => e.remarks?.trim() || NAME_NONE;
 
   // Distinct names in appearance order
@@ -62,12 +70,12 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
       {/* Step 1: name list */}
       {!selectedName && (
         <>
-          <DialogTitle>名称を選択</DialogTitle>
+          <DialogTitle>Select Name</DialogTitle>
           <DialogContent dividers sx={{ p: 0, maxHeight: 400 }}>
             {loading ? (
               <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
             ) : names.length === 0 ? (
-              <Typography sx={{ p: 2, color: "text.secondary" }}>データがありません</Typography>
+              <Typography sx={{ p: 2, color: "text.secondary" }}>No data</Typography>
             ) : (
               <List dense disablePadding>
                 {names.map(name => {
@@ -76,8 +84,8 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
                     <ListItemButton key={name} divider onClick={() => setSelectedName(name)}>
                       <ListItemText
                         primary={name}
-                        secondary={`${count} 件`}
-                        primaryTypographyProps={{ fontWeight: 500 }}
+                        secondary={`${count} record(s)`}
+                        slotProps={{ primary: { sx: { fontWeight: 500 } } }}
                       />
                     </ListItemButton>
                   );
@@ -86,7 +94,7 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
             )}
           </DialogContent>
           <DialogActions>
-            <Button onClick={onClose}>キャンセル</Button>
+            <Button onClick={onClose}>Cancel</Button>
           </DialogActions>
         </>
       )}
@@ -98,21 +106,21 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
             <IconButton size="small" onClick={() => setSelectedName(null)}>
               <ArrowBackIcon fontSize="small" />
             </IconButton>
-            ID を選択
+            Select ID
             <Typography variant="body2" color="text.secondary" sx={{ ml: 0.5 }}>
-              名称: {selectedName}
+              Name: {selectedName}
             </Typography>
           </DialogTitle>
           <DialogContent dividers sx={{ p: 0, maxHeight: 400 }}>
             {filtered.length === 0 ? (
-              <Typography sx={{ p: 2, color: "text.secondary" }}>該当なし</Typography>
+              <Typography sx={{ p: 2, color: "text.secondary" }}>No results</Typography>
             ) : (
               <List dense disablePadding>
                 {filtered.map(exp => (
                   <ListItemButton key={exp.experiment_id} divider onClick={() => { onSelect(exp); onClose(); }}>
                     <ListItemText
                       primary={exp.experiment_id}
-                      primaryTypographyProps={{ fontFamily: "monospace", fontSize: 12 }}
+                      slotProps={{ primary: { sx: { fontFamily: "monospace", fontSize: 12 } } }}
                       secondary={[
                         exp.galvano_system_id ? `galvano: ${exp.galvano_system_id.slice(0, 8)}` : null,
                         exp.welding_condition_id ? `weld: ${exp.welding_condition_id.slice(0, 8)}` : null,
@@ -124,7 +132,7 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
             )}
           </DialogContent>
           <DialogActions>
-            <Button onClick={onClose}>キャンセル</Button>
+            <Button onClick={onClose}>Cancel</Button>
           </DialogActions>
         </>
       )}
@@ -136,7 +144,7 @@ function LoadByNameDialog({ open, onClose, onSelect }: {
 function FromExperimentDialog({ open, onClose, onCreate }: {
   open: boolean;
   onClose: () => void;
-  onCreate: (name: string, exps: Experiment[]) => Promise<void>;
+  onCreate: (projectId: string, name: string, exps: Experiment[]) => Promise<void>;
 }) {
   const [projects, setProjects]   = useState<{ project_id: string; project_name: string }[]>([]);
   const [loading, setLoading]     = useState(false);
@@ -154,7 +162,7 @@ function FromExperimentDialog({ open, onClose, onCreate }: {
     setCreating(proj.project_id);
     try {
       const r = await fetchExperiments({ limit: 2000, project_id: proj.project_id });
-      await onCreate(proj.project_name, r.data.items);
+      await onCreate(proj.project_id, proj.project_name, r.data.items);
       onClose();
     } finally {
       setCreating(null);
@@ -163,13 +171,13 @@ function FromExperimentDialog({ open, onClose, onCreate }: {
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>From EXPERIMENT — プロジェクトを選択</DialogTitle>
+      <DialogTitle>From EXPERIMENT — Select Project</DialogTitle>
       <DialogContent dividers sx={{ p: 0, minHeight: 160 }}>
         {loading ? (
           <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
         ) : projects.length === 0 ? (
           <Typography sx={{ p: 3, color: "text.secondary" }}>
-            Experiment DB にプロジェクトが見つかりません
+            No projects found in Experiment DB
           </Typography>
         ) : (
           <List dense disablePadding>
@@ -183,8 +191,7 @@ function FromExperimentDialog({ open, onClose, onCreate }: {
                 <ListItemText
                   primary={p.project_name}
                   secondary={p.project_id}
-                  primaryTypographyProps={{ fontWeight: 500 }}
-                  secondaryTypographyProps={{ fontFamily: "monospace", fontSize: 11 }}
+                  slotProps={{ primary: { sx: { fontWeight: 500 } }, secondary: { sx: { fontFamily: "monospace", fontSize: 11 } } }}
                 />
                 {creating === p.project_id && <CircularProgress size={18} sx={{ ml: 1 }} />}
               </ListItemButton>
@@ -193,7 +200,7 @@ function FromExperimentDialog({ open, onClose, onCreate }: {
         )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} disabled={creating !== null}>キャンセル</Button>
+        <Button onClick={onClose} disabled={creating !== null}>Cancel</Button>
       </DialogActions>
     </Dialog>
   );
@@ -254,13 +261,13 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
       {!selectedProj ? (
         <>
-          <DialogTitle>プロジェクトを選択（Experiment DB）</DialogTitle>
+          <DialogTitle>Select Project (Experiment DB)</DialogTitle>
           <DialogContent dividers sx={{ p: 0, maxHeight: 420 }}>
             {loading ? (
               <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
             ) : projects.length === 0 ? (
               <Typography sx={{ p: 2, color: "text.secondary" }}>
-                Experiment DBにproject_idが設定された実験がありません
+                No experiments with project_id found in Experiment DB
               </Typography>
             ) : (
               <List dense disablePadding>
@@ -269,8 +276,7 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
                     <ListItemText
                       primary={p.project_name}
                       secondary={p.project_id}
-                      primaryTypographyProps={{ fontWeight: 500 }}
-                      secondaryTypographyProps={{ fontFamily: "monospace", fontSize: 11 }}
+                      slotProps={{ primary: { sx: { fontWeight: 500 } }, secondary: { sx: { fontFamily: "monospace", fontSize: 11 } } }}
                     />
                   </ListItemButton>
                 ))}
@@ -278,7 +284,7 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
             )}
           </DialogContent>
           <DialogActions>
-            <Button onClick={onClose}>キャンセル</Button>
+            <Button onClick={onClose}>Cancel</Button>
           </DialogActions>
         </>
       ) : (
@@ -287,7 +293,7 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
             <IconButton size="small" onClick={() => setSelectedProj(null)}>
               <ArrowBackIcon fontSize="small" />
             </IconButton>
-            実験を選択
+            Select Experiments
             <Typography variant="body2" color="text.secondary" sx={{ ml: 0.5 }}>
               {selectedProj.project_name}
             </Typography>
@@ -318,7 +324,7 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
                       </TableRow>
                     ))}
                     {exps.length === 0 && (
-                      <TableRow><TableCell colSpan={3} align="center" sx={{ color: "text.secondary", py: 3 }}>実験がありません</TableCell></TableRow>
+                      <TableRow><TableCell colSpan={3} align="center" sx={{ color: "text.secondary", py: 3 }}>No experiments</TableCell></TableRow>
                     )}
                   </TableBody>
                 </Table>
@@ -327,11 +333,11 @@ function LoadByProjectDialog({ open, onClose, onSelectAll }: {
           </DialogContent>
           <DialogActions>
             <Typography variant="body2" color="text.secondary" sx={{ flexGrow: 1, pl: 1 }}>
-              {checked.size} / {exps.length} 件選択
+              {checked.size} / {exps.length} selected
             </Typography>
-            <Button onClick={onClose}>キャンセル</Button>
+            <Button onClick={onClose}>Cancel</Button>
             <Button variant="contained" disabled={checked.size === 0} onClick={handleLoad}>
-              プロジェクトに追加
+              Add to Project
             </Button>
           </DialogActions>
         </>
@@ -672,7 +678,10 @@ function deepToDetail(deep: any): ExperimentDetail {
     file_id: exp.file_id ?? null,
     project_id: exp.project_id ?? null,
     project_name: proj?.project_name ?? null,
+    project_remarks: proj?.remarks ?? null,
     remarks: exp.remarks ?? null,
+    // Store raw project object for dynamic display in DetailPanel
+    project: proj,
     galvano_system: gs ? { ...gs, optics: gs.optics_rows ?? [] } : null,
     welding_condition: deep.welding_condition ?? null,
     experiment_material: deep.experiment_material ?? null,
@@ -683,11 +692,16 @@ function deepToDetail(deep: any): ExperimentDetail {
   } as ExperimentDetail;
 }
 
-const KNOWN_EXP_COLS = new Set([
-  "experiment_id", "galvano_system_id", "welding_condition_id",
-  "experiment_material_id", "shielding_condition_id",
-  "result_id", "observation_id", "file_id", "project_id", "project_name", "remarks",
-]);
+function parseCandidates(raw: unknown): Candidate[] {
+  if (raw == null || raw === "") return [];
+  const s = String(raw).trim();
+  const parts = s.includes("|") ? s.split("|") : s.split("/");
+  return parts.map((p: string) => p.trim()).filter(Boolean).map(p => {
+    const idx = p.indexOf(";;");
+    if (idx >= 0) return { label: p.slice(0, idx), color: p.slice(idx + 2) || undefined };
+    return { label: p };
+  });
+}
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function NewProjectPage() {
@@ -711,7 +725,9 @@ export default function NewProjectPage() {
   const [showReportSettings, setShowReportSettings] = useState(false);
 
   const [merging, setMerging] = useState(false);
-  const [mergeResult, setMergeResult] = useState<null | { inserted: number; total: number }>(null);
+  const [mergeResult, setMergeResult] = useState<null | { inserted: number; total: number; updated: number }>(null);
+  const [mergePreview, setMergePreview] = useState<{ conflicts: ConflictItem[]; new_count: number } | null>(null);
+  const [showMergeDiff, setShowMergeDiff] = useState(false);
 
   const [showDeleteProj, setShowDeleteProj] = useState(false);
   const [importingProj, setImportingProj] = useState(false);
@@ -723,7 +739,28 @@ export default function NewProjectPage() {
   const [deepDetail, setDeepDetail] = useState<ExperimentDetail | null>(null);
   const [deepLoading, setDeepLoading] = useState(false);
   const [candidatesMap, setCandidatesMap] = useState<Record<string, Candidate[]>>({});
-  const [customCols, setCustomCols] = useState<{ column_name: string }[]>([]);
+  const [orderedCols, setOrderedCols] = useState<{ column_name: string; is_id: string }[]>([]);
+
+  // ── Filter state ─────────────────────────────────────────────────────────────────────────
+  const [filterState, setFilterState] = useState<FilterState>(FILTER_DEFAULT);
+  // Cache of deep experiment details for search (keyed by experiment_id)
+  const [expDetailCache, setExpDetailCache] = useState<Record<string, ExperimentDetail>>({});
+  const [cacheLoading, setCacheLoading]     = useState(false);
+  const detailLoadingIds = useRef(new Set<string>());
+
+  // Dynamic panel top: align with TableContainer top
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const [panelTop, setPanelTop] = useState(200);
+  useEffect(() => {
+    const measure = () => {
+      if (tableContainerRef.current) {
+        setPanelTop(Math.round(tableContainerRef.current.getBoundingClientRect().top));
+      }
+    };
+    const raf = requestAnimationFrame(measure);
+    window.addEventListener("resize", measure);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", measure); };
+  }, [orderedCols.length, selectedId, experiments.length]);
 
   // ── Loaders ───────────────────────────────────────────────────────────────
   const loadProjects = useCallback(async () => {
@@ -743,21 +780,73 @@ export default function NewProjectPage() {
     else setExperiments([]);
   }, [selectedId, loadExperiments]);
 
-  // Reset detail when project changes
+  // Reset detail and filter when project changes
   useEffect(() => {
     setSelectedExpId(null);
     setDeepDetail(null);
+    setFilterState(FILTER_DEFAULT);
+    setExpDetailCache({});
+    detailLoadingIds.current.clear();
   }, [selectedId]);
 
   // Load candidatesMap and custom EXPERIMENT columns once
   useEffect(() => {
+    const TABLES = [
+      "GALVANO_SYSTEM", "FTHETA", "OPTICS", "LASER_DEVICE", "LASER_BEAM", "DOE",
+      "WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER",
+      "SUB_TRAJECTORY", "WOBBLING_PARAMETER",
+      "EXPERIMENT_MATERIAL", "MATERIAL_STATE", "MATERIAL",
+      "SHIELDING_CONDITION", "RESULT", "OBSERVATION", "FILE",
+    ];
+    Promise.all(TABLES.map(t => columnDefsTableApi(t).list().catch(() => ({ data: [] })))).then(results => {
+      const map: Record<string, Candidate[]> = {};
+      for (const res of results) {
+        for (const row of (res.data as any[])) {
+          if (row.candidates) {
+            const parts = parseCandidates(row.candidates);
+            if (parts.length) map[row.column_name] = parts;
+          }
+        }
+      }
+      setCandidatesMap(map);
+    });
     columnDefsTableApi("EXPERIMENT").list().then(r => {
-      const cols = (r.data as any[])
-        .filter(c => (c.is_id === "" || !c.is_id) && !KNOWN_EXP_COLS.has(c.column_name))
-        .sort((a, b) => (a.order_index ?? 999) - (b.order_index ?? 999));
-      setCustomCols(cols);
+      const defs = (r.data as any[]).filter(c => c.column_name !== "project_name");
+      setOrderedCols(defs.sort((a, b) => (a.order_index ?? 999) - (b.order_index ?? 999)));
     }).catch(() => {});
   }, []);
+
+  // Batch-load deep detail for all project experiments when filter is active
+  useEffect(() => {
+    if (!filterState.value || !selectedId) return;
+    const toLoad = experiments.filter(
+      (e) =>
+        !(e.experiment_id in expDetailCache) &&
+        !detailLoadingIds.current.has(e.experiment_id),
+    );
+    if (!toLoad.length) return;
+
+    setCacheLoading(true);
+    toLoad.forEach((e) => detailLoadingIds.current.add(e.experiment_id));
+    const BATCH = 5;
+    const runBatches = async () => {
+      for (let i = 0; i < toLoad.length; i += BATCH) {
+        const batch = toLoad.slice(i, i + BATCH);
+        await Promise.allSettled(
+          batch.map((e) =>
+            projectsApi.getExperimentDeep(selectedId, e.experiment_id).then((r) =>
+              setExpDetailCache((prev) => ({
+                ...prev,
+                [e.experiment_id]: deepToDetail(r.data),
+              })),
+            ),
+          ),
+        );
+      }
+    };
+    runBatches().finally(() => setCacheLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterState.value, experiments, selectedId]);
 
   const handleExpRowClick = async (exp: ProjectExperiment) => {
     if (!selectedId) return;
@@ -771,13 +860,30 @@ export default function NewProjectPage() {
     setDeepLoading(true);
     try {
       const res = await projectsApi.getExperimentDeep(selectedId, exp.experiment_id);
-      setDeepDetail(deepToDetail(res.data));
+      const detail = deepToDetail(res.data);
+      setDeepDetail(detail);
+      // Populate search cache too
+      setExpDetailCache((prev) => ({ ...prev, [exp.experiment_id]: detail }));
     } finally {
       setDeepLoading(false);
     }
   };
 
   const selected = projects.find((p) => p.project_id === selectedId);
+
+  const colNames = useMemo(() => orderedCols.map((c) => c.column_name), [orderedCols]);
+
+  const visibleExps = useMemo(() => {
+    if (!filterState.value) return experiments;
+    return experiments.filter((exp) =>
+      matchDeep(
+        exp as unknown as Record<string, unknown>,
+        (expDetailCache[exp.experiment_id] as unknown as Record<string, unknown>) ?? null,
+        filterState,
+        colNames,
+      ),
+    );
+  }, [experiments, filterState, expDetailCache, colNames]);
 
   // ── Project actions ───────────────────────────────────────────────────────
   const handleCreateProject = async () => {
@@ -816,9 +922,9 @@ export default function NewProjectPage() {
       const r = await projectsApi.importDb(file);
       await loadProjects();
       setSelectedId(r.data.project_id);
-      setToast({ msg: `プロジェクト "${r.data.name}" をインポートしました`, sev: "success" });
+      setToast({ msg: `Project "${r.data.name}" imported successfully`, sev: "success" });
     } catch (err: any) {
-      const msg = err?.response?.data?.detail ?? "インポートに失敗しました";
+      const msg = err?.response?.data?.detail ?? "Import failed";
       setToast({ msg, sev: "error" });
     } finally {
       setImportingProj(false);
@@ -865,7 +971,7 @@ export default function NewProjectPage() {
   const handleCopyFromMain = async (exp: Experiment) => {
     if (!selectedId) return;
     const payload: Partial<ProjectExperiment> = {
-      experiment_id: exp.experiment_id,
+      // experiment_id omitted → backend generates new UUID
       galvano_system_id: exp.galvano_system_id,
       welding_condition_id: exp.welding_condition_id,
       experiment_material_id: exp.experiment_material_id,
@@ -885,7 +991,7 @@ export default function NewProjectPage() {
     if (!selectedId || exps.length === 0) return;
     for (const exp of exps) {
       await projectsApi.createExperiment(selectedId, {
-        experiment_id: exp.experiment_id,
+        // experiment_id omitted → backend generates new UUID
         galvano_system_id: exp.galvano_system_id,
         welding_condition_id: exp.welding_condition_id,
         experiment_material_id: exp.experiment_material_id,
@@ -898,15 +1004,15 @@ export default function NewProjectPage() {
     }
     await loadExperiments(selectedId);
     await loadProjects();
-    setToast({ msg: `${exps.length} 件を追加しました`, sev: "success" });
+    setToast({ msg: `${exps.length} experiment(s) added`, sev: "success" });
   };
 
-  const handleCreateFromExperiments = async (name: string, exps: Experiment[]) => {
-    const r = await projectsApi.create(name);
+  const handleCreateFromExperiments = async (projectId: string, name: string, exps: Experiment[]) => {
+    const r = await projectsApi.create(name, projectId);
     const pid = r.data.project_id;
     for (const exp of exps) {
       await projectsApi.createExperiment(pid, {
-        experiment_id: exp.experiment_id,
+        experiment_id: exp.experiment_id,   // preserve original ID
         galvano_system_id: exp.galvano_system_id,
         welding_condition_id: exp.welding_condition_id,
         experiment_material_id: exp.experiment_material_id,
@@ -914,12 +1020,13 @@ export default function NewProjectPage() {
         result_id: exp.result_id,
         observation_id: exp.observation_id,
         file_id: exp.file_id,
+        project_id: exp.project_id ?? pid,  // preserve original project_id
         remarks: exp.remarks ?? null,
       });
     }
     await loadProjects();
     setSelectedId(pid);
-    setToast({ msg: `プロジェクト "${name}" を作成しました（${exps.length} 件）`, sev: "success" });
+    setToast({ msg: `Project "${name}" created (${exps.length} experiment(s))`, sev: "success" });
   };
 
   const handleCopyFromProject = async (exp: ProjectExperiment) => {
@@ -943,15 +1050,30 @@ export default function NewProjectPage() {
   // ── Merge ─────────────────────────────────────────────────────────────────
   const handleMerge = async () => {
     if (!selectedId) return;
-    if (!confirm(`Merge project "${selected?.name}" into the main DB?\nExisting records will not be overwritten.`)) return;
     setMerging(true);
     try {
-      const r = await projectsApi.merge(selectedId);
+      const r = await projectsApi.mergePreview(selectedId);
+      setMergePreview(r.data);
+      setShowMergeDiff(true);
+    } catch {
+      setToast({ msg: "Merge preview failed", sev: "error" });
+    } finally {
+      setMerging(false);
+    }
+  };
+
+  const handleMergeConfirm = async (overwriteIds: string[]) => {
+    if (!selectedId) return;
+    setShowMergeDiff(false);
+    setMerging(true);
+    try {
+      const r = await projectsApi.merge(selectedId, overwriteIds);
       const details = r.data.details;
-      const totalInserted = Object.values(details).reduce((s, v) => s + v.inserted, 0);
-      const totalSkipped = Object.values(details).reduce((s, v) => s + v.skipped, 0);
-      setMergeResult({ inserted: totalInserted, total: totalInserted + totalSkipped });
-      setToast({ msg: `Merge complete: ${totalInserted} records inserted`, sev: "success" });
+      const totalInserted = Object.values(details).reduce((s, v) => s + (v.inserted ?? 0), 0);
+      const totalSkipped  = Object.values(details).reduce((s, v) => s + (v.skipped  ?? 0), 0);
+      const totalUpdated  = Object.values(details).reduce((s, v) => s + (v.updated  ?? 0), 0);
+      setMergeResult({ inserted: totalInserted, total: totalInserted + totalSkipped + totalUpdated, updated: totalUpdated });
+      setToast({ msg: `Merge complete: ${totalInserted} inserted / ${totalUpdated} updated`, sev: "success" });
     } catch {
       setToast({ msg: "Merge failed", sev: "error" });
     } finally {
@@ -1005,11 +1127,12 @@ export default function NewProjectPage() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <Box sx={{ display: "flex", gap: 2, height: "calc(100vh - 120px)" }}>
+    <Box sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
       {/* ── Left sidebar: project list ── */}
       <Paper
         variant="outlined"
-        sx={{ width: 240, flexShrink: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}
+        sx={{ width: 240, flexShrink: 0, display: "flex", flexDirection: "column", overflow: "hidden",
+             position: "sticky", top: 0, maxHeight: "100vh", alignSelf: "flex-start" }}
       >
         <Box sx={{ p: 1.5, borderBottom: 1, borderColor: "divider", display: "flex", flexDirection: "column", gap: 0.75 }}>
           <Button
@@ -1053,8 +1176,7 @@ export default function NewProjectPage() {
                   <ListItemText
                     primary={p.name}
                     secondary={`${p.experiment_count} experiments · ${p.created_at.slice(0, 10)}`}
-                    primaryTypographyProps={{ noWrap: true, fontWeight: p.project_id === selectedId ? 600 : 400 }}
-                    secondaryTypographyProps={{ fontSize: 11 }}
+                    slotProps={{ primary: { noWrap: true, sx: { fontWeight: p.project_id === selectedId ? 600 : 400 } }, secondary: { sx: { fontSize: 11 } } }}
                   />
                   <ExpandMoreIcon
                     fontSize="small"
@@ -1072,7 +1194,7 @@ export default function NewProjectPage() {
       </Paper>
 
       {/* ── Right content ── */}
-      <Box sx={{ flexGrow: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <Box sx={{ flexGrow: 1, minWidth: 0 }}>
         {!selected ? (
           <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: "text.secondary", gap: 1 }}>
             <FolderOpenIcon sx={{ fontSize: 48, opacity: 0.3 }} />
@@ -1146,71 +1268,71 @@ export default function NewProjectPage() {
 
             {mergeResult && (
               <Alert severity="success" onClose={() => setMergeResult(null)} sx={{ mb: 1.5 }}>
-                Merge complete — {mergeResult.inserted} records inserted (of {mergeResult.total} total)
+                Merge complete — {mergeResult.inserted} inserted / {mergeResult.updated} updated (total {mergeResult.total})
               </Alert>
             )}
 
             <Divider sx={{ mb: 1.5 }} />
 
             {/* Experiment table + detail panel */}
-            <Box sx={{ display: "flex", gap: 1.5, alignItems: "flex-start", flexGrow: 1, overflow: "hidden" }}>
-              <TableContainer component={Paper} variant="outlined" sx={{ flex: (deepDetail !== null || deepLoading) ? "0 0 58%" : "1 1 100%", overflow: "auto" }}>
-              <Table size="small" stickyHeader>
+            <Box sx={{ width: "100%" }}>
+              <Box sx={{ mb: 1, paddingRight: (deepDetail !== null || deepLoading) ? "41vw" : 0 }}>
+                <ExperimentFilterBar
+                  filter={filterState}
+                  onChange={setFilterState}
+                  cols={orderedCols}
+                  loading={cacheLoading}
+                />
+              </Box>
+              <Box sx={{ paddingRight: (deepDetail !== null || deepLoading) ? "41vw" : 0 }}>
+              <TableContainer component={Paper} variant="outlined" ref={tableContainerRef} sx={{ overflowX: "auto" }}>
+              <Table size="small" sx={{ tableLayout: "auto", minWidth: 1100, "& tbody td": { paddingTop: "0 !important", paddingBottom: "0 !important", px: "6px", lineHeight: "1.4" } }}>
                 <TableHead>
                   <TableRow>
                     <TableCell>#</TableCell>
-                    <TableCell>experiment_id</TableCell>
-                    <TableCell>project_id</TableCell>
-                    <TableCell>galvano_system_id</TableCell>
-                    <TableCell>welding_condition_id</TableCell>
-                    <TableCell>experiment_material_id</TableCell>
-                    <TableCell>shielding_condition_id</TableCell>
-                    <TableCell>remarks</TableCell>
-                    {customCols.map(col => (
-                      <TableCell key={col.column_name} sx={{ whiteSpace: "nowrap", fontSize: 11 }}>{col.column_name}</TableCell>
+                    {orderedCols.map(col => (
+                      <TableCell key={col.column_name} sx={{ whiteSpace: "nowrap", fontSize: 11, minWidth: col.column_name.endsWith("_id") ? 90 : col.column_name.includes("datetime") ? 140 : 100 }}>
+                        {col.column_name}
+                      </TableCell>
                     ))}
-                    <TableCell align="center">Actions</TableCell>
+                    <TableCell>Actions</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {experiments.length === 0 ? (
+                  {visibleExps.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={8 + customCols.length} align="center" sx={{ py: 4, color: "text.secondary" }}>
-                        No experiments yet. Use "Add Experiment" or "Copy from Main".
+                      <TableCell colSpan={orderedCols.length + 2} align="center" sx={{ py: 4, color: "text.secondary" }}>
+                        {experiments.length === 0
+                          ? "No experiments yet. Use \"Add Experiment\" or \"Copy from Main\"."
+                          : `No matches (${experiments.length} total)`}
                       </TableCell>
                     </TableRow>
-                  ) : (
-                    experiments.map((exp, idx) => (
-                      <TableRow
-                        key={exp.experiment_id}
-                        hover
-                        selected={exp.experiment_id === selectedExpId}
-                        sx={{ cursor: "pointer" }}
-                        onClick={() => handleExpRowClick(exp)}
-                      >
-                        <TableCell>{idx + 1}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.experiment_id)}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.project_id)}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.galvano_system_id)}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.welding_condition_id)}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.experiment_material_id)}</TableCell>
-                        <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.shielding_condition_id)}</TableCell>
-                        <TableCell sx={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {exp.remarks ?? ""}
-                        </TableCell>
-                        {customCols.map(col => (
-                          <TableCell key={col.column_name} sx={{ fontSize: 11 }}>
-                            {String((exp as any)[col.column_name] ?? "")}
+                  ) : visibleExps.map((exp, idx) => (
+                    <TableRow
+                      key={exp.experiment_id}
+                      hover
+                      selected={exp.experiment_id === selectedExpId}
+                      sx={{ cursor: "pointer", "& td": { paddingTop: "0 !important", paddingBottom: "0 !important" } }}
+                      onClick={() => handleExpRowClick(exp)}
+                    >
+                      <TableCell style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontSize: 12 }}>{idx + 1}</TableCell>
+                      {orderedCols.map(col => {
+                        const val = (exp as any)[col.column_name];
+                        const isId = col.is_id === "pk" || col.is_id === "fk";
+                        return (
+                          <TableCell key={col.column_name} style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontFamily: isId ? "monospace" : undefined, fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 180 }}>
+                            {isId ? sid(val) : (val != null ? String(val) : "")}
                           </TableCell>
-                        ))}
-                        <TableCell align="center" onClick={e => e.stopPropagation()}>
-                          <Tooltip title="Copy">
-                            <IconButton size="small" onClick={() => handleCloneExp(exp)}>
-                              <ContentCopyIcon sx={{ fontSize: 13 }} />
-                            </IconButton>
-                          </Tooltip>
-                          <Tooltip title="Edit">
-                            <IconButton
+                        );
+                      })}
+                      <TableCell align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ whiteSpace: "nowrap" }} onClick={e => e.stopPropagation()}>
+                        <Tooltip title="Copy">
+                          <IconButton size="small" onClick={() => handleCloneExp(exp)}>
+                            <ContentCopyIcon sx={{ fontSize: 13 }} />
+                          </IconButton>
+                        </Tooltip>
+                        <Tooltip title="Edit">
+                          <IconButton
                               size="small"
                               onClick={() => { setEditingExp(exp); setShowExpForm(true); }}
                             >
@@ -1227,15 +1349,25 @@ export default function NewProjectPage() {
                           </Tooltip>
                         </TableCell>
                       </TableRow>
-                    ))
-                  )}
+                  ))}
                 </TableBody>
               </Table>
               </TableContainer>
+              </Box>
 
-              {/* Detail panel */}
+              {/* Detail panel – fixed full height below AppBar */}
               {(deepDetail !== null || deepLoading) && (
-                <Box sx={{ flex: "0 0 40%", minWidth: 280, overflow: "auto" }}>
+                <Box sx={{
+                  position: "fixed",
+                  top: `${panelTop}px`,
+                  right: 0,
+                  bottom: 0,
+                  width: "40%",
+                  overflow: "auto",
+                  zIndex: 100,
+                  bgcolor: "background.paper",
+                  boxShadow: 6,
+                }}>
                   {deepLoading ? (
                     <Paper sx={{ p: 2, display: "flex", justifyContent: "center" }}>
                       <CircularProgress size={24} />
@@ -1244,6 +1376,8 @@ export default function NewProjectPage() {
                     <DetailPanel
                       detail={deepDetail}
                       candidatesMap={candidatesMap}
+                      extraExpCols={orderedCols}
+                      projectData={(deepDetail as any).project ?? undefined}
                       onEdit={() => {
                         const exp = experiments.find(e => e.experiment_id === selectedExpId);
                         if (exp) { setEditingExp(exp); setShowExpForm(true); }
@@ -1334,19 +1468,31 @@ export default function NewProjectPage() {
         <DialogTitle sx={{ color: "error.main" }}>Delete Project</DialogTitle>
         <DialogContent>
           <Typography>
-            プロジェクト <strong>"{selected?.name}"</strong> を削除しますか？
+            Delete project <strong>"{selected?.name}"</strong>?
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-            プロジェクトのデータベースファイル（.db）も完全に削除されます。この操作は元に戻せません。
+            The project database file (.db) will also be permanently deleted. This action cannot be undone.
           </Typography>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setShowDeleteProj(false)}>キャンセル</Button>
+          <Button onClick={() => setShowDeleteProj(false)}>Cancel</Button>
           <Button variant="contained" color="error" onClick={handleDeleteProject}>
-            削除する
+            Delete
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* ── Merge Diff Dialog ── */}
+      {mergePreview && (
+        <MergeDiffDialog
+          open={showMergeDiff}
+          projectName={selected?.name ?? ""}
+          conflicts={mergePreview.conflicts}
+          newCount={mergePreview.new_count}
+          onCancel={() => setShowMergeDiff(false)}
+          onConfirm={handleMergeConfirm}
+        />
+      )}
 
       {/* ── Toast ── */}
       <Snackbar

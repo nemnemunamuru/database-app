@@ -1,11 +1,10 @@
-﻿import { useState, useEffect, useCallback } from "react";
+﻿import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import {
   Box, Button, CircularProgress,
-  IconButton, InputAdornment, Paper, Table, TableBody,
+  IconButton, Paper, Table, TableBody,
   TableCell, TableContainer, TableHead, TableRow,
-  TextField, Tooltip, Typography,
+  Tooltip, Typography,
 } from "@mui/material";
-import SearchIcon from "@mui/icons-material/Search";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import DeleteIcon from "@mui/icons-material/Delete";
 import EditIcon from "@mui/icons-material/Edit";
@@ -17,6 +16,12 @@ import {
 import { columnDefsTableApi } from "../../api/masters";
 import type { Candidate } from "../masters/EntityCrud";
 import { DetailPanel } from "./ExperimentDetailPanel";
+import ExperimentFilterBar from "../common/ExperimentFilterBar";
+import {
+  type FilterState,
+  FILTER_DEFAULT,
+  matchDeep,
+} from "../../utils/experimentFilter";
 
 function parseCandidates(raw: any): Candidate[] {
   if (raw == null || raw === "") return [];
@@ -37,22 +42,24 @@ interface Props {
   refresh: number;
 }
 
-const KNOWN_EXP_COLS = new Set([
-  "experiment_id", "galvano_system_id", "welding_condition_id",
-  "experiment_material_id", "shielding_condition_id",
-  "result_id", "observation_id", "file_id", "project_id", "project_name", "remarks",
-]);
+// Columns that are never shown as regular data columns in the table
+const HIDDEN_COLS = new Set(["project_name"]);
 
 export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
   const [items, setItems]       = useState<Experiment[]>([]);
   const [total, setTotal]       = useState(0);
-  const [search, setSearch]     = useState("");
+  const [filterState, setFilterState] = useState<FilterState>(FILTER_DEFAULT);
   const [loading, setLoading]   = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail]     = useState<ExperimentDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [candidatesMap, setCandidatesMap] = useState<Record<string, Candidate[]>>({});
-  const [customCols, setCustomCols] = useState<{ column_name: string }[]>([]);
+  // All ordered columns from column_def (including fixed FK cols)
+  const [orderedCols, setOrderedCols] = useState<{ column_name: string; is_id: string }[]>([]);
+  // Cache of lazily-loaded ExperimentDetail objects (for deep search)
+  const [detailCache, setDetailCache] = useState<Record<string, ExperimentDetail>>({});
+  const [cacheLoading, setCacheLoading] = useState(false);
+  const loadingIds = useRef(new Set<string>());
 
   useEffect(() => {
     const TABLES = [
@@ -75,27 +82,56 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
       setCandidatesMap(map);
     });
     columnDefsTableApi("EXPERIMENT").list().then(r => {
-      const cols = (r.data as any[])
-        .filter(c => (c.is_id === "" || !c.is_id) && !KNOWN_EXP_COLS.has(c.column_name))
-        .sort((a, b) => (a.order_index ?? 999) - (b.order_index ?? 999));
-      setCustomCols(cols);
+      const defs = (r.data as any[]).filter(c => !HIDDEN_COLS.has(c.column_name));
+      setOrderedCols(defs.sort((a, b) => (a.order_index ?? 999) - (b.order_index ?? 999)));
     }).catch(() => {});
   }, []);
 
-  const load = useCallback(async (keyword = "") => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetchExperiments({ remarks: keyword || undefined, limit: 100 });
+      const res = await fetchExperiments({ limit: 200 });
       setItems(res.data.items);
       setTotal(res.data.total);
+      // Clear cache when list refreshes
+      setDetailCache({});
+      loadingIds.current.clear();
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    load(search);
+    load();
   }, [refresh]);
+
+  // When a filter value is active, batch-load detail for all items not yet cached
+  useEffect(() => {
+    if (!filterState.value) return;
+    const toLoad = items.filter(
+      (e) => !(e.experiment_id in detailCache) && !loadingIds.current.has(e.experiment_id),
+    );
+    if (!toLoad.length) return;
+
+    setCacheLoading(true);
+    toLoad.forEach((e) => loadingIds.current.add(e.experiment_id));
+
+    const BATCH = 5;
+    const runBatches = async () => {
+      for (let i = 0; i < toLoad.length; i += BATCH) {
+        const batch = toLoad.slice(i, i + BATCH);
+        await Promise.allSettled(
+          batch.map((e) =>
+            fetchExperimentDetail(e.experiment_id).then((r) =>
+              setDetailCache((prev) => ({ ...prev, [e.experiment_id]: r.data })),
+            ),
+          ),
+        );
+      }
+    };
+    runBatches().finally(() => setCacheLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterState.value, items]);
 
   const handleRowClick = async (exp: Experiment) => {
     if (selectedId === exp.experiment_id) {
@@ -109,6 +145,8 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
     try {
       const res = await fetchExperimentDetail(exp.experiment_id);
       setDetail(res.data);
+      // Populate deep-search cache too
+      setDetailCache((prev) => ({ ...prev, [exp.experiment_id]: res.data }));
     } finally {
       setDetailLoading(false);
     }
@@ -118,92 +156,110 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
     if (!confirm("Delete this experiment?")) return;
     await deleteExperiment(id);
     if (selectedId === id) { setSelectedId(null); setDetail(null); }
-    load(search);
+    load();
   };
 
   const handleClone = async (id: string) => {
     await cloneExperiment(id);
-    load(search);
+    load();
   };
+
+  const colNames = useMemo(() => orderedCols.map((c) => c.column_name), [orderedCols]);
+
+  const visibleItems = useMemo(() => {
+    if (!filterState.value) return items;
+    return items.filter((exp) =>
+      matchDeep(
+        exp as unknown as Record<string, unknown>,
+        (detailCache[exp.experiment_id] as unknown as Record<string, unknown>) ?? null,
+        filterState,
+        colNames,
+      ),
+    );
+  }, [items, filterState, detailCache, colNames]);
 
   const selectedExp = items.find((e) => e.experiment_id === selectedId);
   const showDetail  = detail !== null || detailLoading;
-  const colSpanCount = 10 + customCols.length;
+  const colSpanCount = orderedCols.length + 1;
+
+  // Scroll the selected row into view when detail loads
+  const selectedRowRef = useRef<HTMLTableRowElement | null>(null);
+  useEffect(() => {
+    if (selectedId) {
+      const id = requestAnimationFrame(() =>
+        selectedRowRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }),
+      );
+      return () => cancelAnimationFrame(id);
+    }
+  }, [selectedId]);
+
+  // Dynamic panel top: align with TableContainer top
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const [panelTop, setPanelTop] = useState(200);
+  useEffect(() => {
+    const measure = () => {
+      if (tableContainerRef.current) {
+        setPanelTop(Math.round(tableContainerRef.current.getBoundingClientRect().top));
+      }
+    };
+    const raf = requestAnimationFrame(measure);
+    window.addEventListener("resize", measure);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", measure); };
+  }, [loading, orderedCols.length]);
 
   return (
     <Box sx={{ width: "100%" }}>
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1.5 }}>
-        <Typography variant="h6">Experiments (total: {total})</Typography>
+        <Typography variant="h6">
+          Experiments ({visibleItems.length} / {total})
+        </Typography>
         <Box sx={{ display: "flex", gap: 1 }}>
           <Button variant="contained" size="small" onClick={onAddNew}>+ Add New</Button>
         </Box>
       </Box>
-      <TextField
-        size="small"
-        placeholder="Search by remarks"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && load(search)}
-        slotProps={{
-          input: {
-            startAdornment: (
-              <InputAdornment position="start"><SearchIcon fontSize="small" /></InputAdornment>
-            ),
-          },
-        }}
-        sx={{ mb: 1.5, width: 260 }}
-      />
+      <Box sx={{ mb: 1.5, paddingRight: showDetail ? "41%" : 0, transition: "padding-right 0.15s ease" }}>
+        <ExperimentFilterBar
+          filter={filterState}
+          onChange={setFilterState}
+          cols={orderedCols}
+          loading={cacheLoading}
+        />
+      </Box>
 
       {loading ? <CircularProgress /> : (
-        <Box sx={{ display: "flex", gap: 1.5, alignItems: "flex-start", width: "100%" }}>
-          <Box sx={{ flex: showDetail ? "0 0 56%" : "1 1 100%", minWidth: 0, overflow: "auto" }}>
-            <TableContainer component={Paper}>
-              <Table size="small" sx={{ tableLayout: "auto", minWidth: 1100 }}>
+        <Box sx={{ paddingRight: showDetail ? "41%" : 0, transition: "padding-right 0.15s ease" }}>
+          <TableContainer component={Paper} ref={tableContainerRef} sx={{ overflowX: "auto" }}>
+              <Table size="small" sx={{ tableLayout: "auto", minWidth: 1100, "& tbody td": { paddingTop: "0 !important", paddingBottom: "0 !important", px: "6px", lineHeight: "1.4" } }}>
                 <TableHead>
                   <TableRow>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>experiment_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>project_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>galvano_system_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>welding_condition_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>experiment_material_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>shielding_condition_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>result_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>observation_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11 }}>file_id</TableCell>
-                    <TableCell sx={{ whiteSpace: "nowrap", fontSize: 11, minWidth: 120 }}>remarks</TableCell>
-                    {customCols.map(col => (
-                      <TableCell key={col.column_name} sx={{ whiteSpace: "nowrap", fontSize: 11, minWidth: 100 }}>{col.column_name}</TableCell>
+                    {orderedCols.map(col => (
+                      <TableCell key={col.column_name} sx={{ whiteSpace: "nowrap", fontSize: 11, minWidth: col.column_name.endsWith("_id") ? 90 : col.column_name.includes("datetime") ? 140 : 100 }}>
+                        {col.column_name}
+                      </TableCell>
                     ))}
                     <TableCell align="center" sx={{ whiteSpace: "nowrap" }} />
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {items.map((exp) => (
+                  {visibleItems.map((exp) => (
                     <TableRow
                       key={exp.experiment_id}
+                      ref={exp.experiment_id === selectedId ? selectedRowRef : null}
                       hover
                       selected={exp.experiment_id === selectedId}
-                      sx={{ cursor: "pointer" }}
+                      sx={{ cursor: "pointer", "& td": { paddingTop: "0 !important", paddingBottom: "0 !important" } }}
                       onClick={() => handleRowClick(exp)}
                     >
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.experiment_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.project_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.galvano_system_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.welding_condition_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.experiment_material_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.shielding_condition_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.result_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.observation_id)}</TableCell>
-                      <TableCell sx={{ fontFamily: "monospace", fontSize: 11 }}>{sid(exp.file_id)}</TableCell>
-                      <TableCell sx={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {exp.remarks ?? ""}
-                      </TableCell>
-                      {customCols.map(col => (
-                        <TableCell key={col.column_name} sx={{ fontSize: 11 }}>
-                          {String((exp as any)[col.column_name] ?? "")}
-                        </TableCell>
-                      ))}
-                      <TableCell align="center" onClick={(e) => e.stopPropagation()}>
+                      {orderedCols.map(col => {
+                        const val = (exp as any)[col.column_name];
+                        const isId = col.is_id === "pk" || col.is_id === "fk";
+                        return (
+                          <TableCell key={col.column_name} style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontFamily: isId ? "monospace" : undefined, fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 180 }}>
+                            {isId ? sid(val) : (val != null ? String(val) : "")}
+                          </TableCell>
+                        );
+                      })}
+                      <TableCell align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ whiteSpace: "nowrap" }} onClick={(e) => e.stopPropagation()}>
                         <Tooltip title="Copy">
                           <IconButton size="small" onClick={() => handleClone(exp.experiment_id)}>
                             <ContentCopyIcon sx={{ fontSize: 13 }} />
@@ -222,18 +278,29 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
                       </TableCell>
                     </TableRow>
                   ))}
-                  {items.length === 0 && (
+                  {visibleItems.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={colSpanCount} align="center">No data</TableCell>
+                      <TableCell colSpan={colSpanCount} align="center">
+                        {items.length === 0 ? "No data" : `No matches (${items.length} loaded)`}
+                      </TableCell>
                     </TableRow>
                   )}
                 </TableBody>
               </Table>
-            </TableContainer>
-          </Box>
+          </TableContainer>
 
           {showDetail && (
-            <Box sx={{ flex: "0 0 42%", minWidth: 300 }}>
+            <Box sx={{
+              position: "fixed",
+              top: `${panelTop}px`,
+              right: 0,
+              bottom: 0,
+              width: "40%",
+              overflow: "auto",
+              zIndex: 100,
+              bgcolor: "background.paper",
+              boxShadow: 6,
+            }}>
               {detailLoading ? (
                 <Paper sx={{ p: 2, display: "flex", justifyContent: "center" }}>
                   <CircularProgress size={24} />
@@ -242,6 +309,8 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
                 <DetailPanel
                   detail={detail}
                   candidatesMap={candidatesMap}
+                  extraExpCols={orderedCols}
+                  projectData={(detail as any).project ?? undefined}
                   onEdit={() => selectedExp && onSelect(selectedExp)}
                   onClose={() => { setSelectedId(null); setDetail(null); }}
                 />

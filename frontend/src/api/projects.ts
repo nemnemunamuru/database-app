@@ -18,6 +18,8 @@ export interface ProjectExperiment {
   file_id: string | null;
   project_id: string | null;
   remarks: string | null;
+  created_datetime: string | null;
+  updated_datetime: string | null;
 }
 
 export interface ReportFieldSection {
@@ -33,8 +35,8 @@ export const projectsApi = {
   list: () =>
     api.get<Project[]>("/api/projects"),
 
-  create: (name: string) =>
-    api.post<Project>("/api/projects", { name }),
+  create: (name: string, projectId?: string) =>
+    api.post<Project>("/api/projects", { name, project_id: projectId }),
 
   rename: (id: string, name: string) =>
     api.put<{ project_id: string; name: string }>(`/api/projects/${id}`, { name }),
@@ -54,9 +56,15 @@ export const projectsApi = {
   deleteExperiment: (id: string, expId: string) =>
     api.delete(`/api/projects/${id}/experiments/${expId}`),
 
-  merge: (id: string) =>
-    api.post<{ message: string; details: Record<string, { inserted: number; skipped: number }> }>(
+  mergePreview: (id: string) =>
+    api.get<{ conflicts: { experiment_id: string; diffs: Record<string, { main: unknown; project: unknown }> }[]; new_count: number }>(
+      `/api/projects/${id}/merge/preview`,
+    ),
+
+  merge: (id: string, overwriteIds: string[] = []) =>
+    api.post<{ message: string; details: Record<string, { inserted: number; skipped: number; updated: number }> }>(
       `/api/projects/${id}/merge`,
+      { overwrite_ids: overwriteIds },
     ),
 
   getExperimentDeep: (id: string, expId: string) =>
@@ -85,4 +93,10 @@ export const projectsApi = {
       { headers: { "Content-Type": "multipart/form-data" } }
     );
   },
+
+  getSetting: (projectId: string, key: string) =>
+    api.get<{ key: string; value: string | null }>(`/api/projects/${projectId}/settings/${key}`),
+
+  setSetting: (projectId: string, key: string, value: string) =>
+    api.put(`/api/projects/${projectId}/settings/${key}`, { value }),
 };

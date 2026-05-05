@@ -1,12 +1,17 @@
 import uuid
+from datetime import datetime
 from sqlalchemy import (
-    Boolean, Column, Float, ForeignKey, Integer, String, Text
+    Boolean, Column, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
 class Base(DeclarativeBase):
@@ -201,13 +206,19 @@ class MaterialState(Base):
 # ── Experiment material ──────────────────────────────────────────────────────
 class ExperimentMaterial(Base):
     __tablename__ = "experiment_material"
-    experiment_material_id = Column(String, primary_key=True, default=new_uuid)
-    material_state_id = Column(String, ForeignKey("material_state.material_state_id"))
-    material_role = Column(String)
-    remarks = Column(Text)
+    experiment_material_id = Column(String, primary_key=True)
+    material_role          = Column(String, primary_key=True)
+    material_state_id      = Column(String, ForeignKey("material_state.material_state_id"))
+    remarks                = Column(Text)
 
     material_state = relationship("MaterialState", back_populates="experiment_materials")
-    experiments = relationship("Experiment", back_populates="experiment_material")
+    experiments = relationship(
+        "Experiment",
+        primaryjoin="ExperimentMaterial.experiment_material_id == foreign(Experiment.experiment_material_id)",
+        uselist=True,
+        overlaps="experiment_materials",
+        viewonly=True,
+    )
 
 
 class ShieldingCondition(Base):
@@ -270,6 +281,7 @@ class Project(Base):
     __tablename__ = "project"
     project_id   = Column(String, primary_key=True, default=new_uuid)
     project_name = Column(String)
+    remarks      = Column(String)
 
     experiments = relationship("Experiment", back_populates="project")
 
@@ -286,10 +298,18 @@ class Experiment(Base):
     file_id = Column(String, ForeignKey("file.file_id"))
     project_id = Column(String, ForeignKey("project.project_id"))
     remarks = Column(Text)
+    created_datetime = Column(Text, default=_now_iso)
+    updated_datetime = Column(Text, default=_now_iso, onupdate=_now_iso)
 
     galvano_system = relationship("GalvanoSystem", back_populates="experiments")
     welding_condition = relationship("WeldingCondition", back_populates="experiments")
-    experiment_material = relationship("ExperimentMaterial", back_populates="experiments")
+    experiment_materials = relationship(
+        "ExperimentMaterial",
+        primaryjoin="Experiment.experiment_material_id == foreign(ExperimentMaterial.experiment_material_id)",
+        uselist=True,
+        overlaps="experiments",
+        viewonly=True,
+    )
     shielding_condition = relationship("ShieldingCondition", back_populates="experiments")
     result = relationship("Result", back_populates="experiments")
     observation = relationship("Observation", back_populates="experiments")
@@ -307,6 +327,18 @@ class ColumnDef(Base):
     is_id = Column(String, default="")
     candidates = Column(Text)
     order_index = Column(Integer, default=0)
+
+
+class TrajectoryTypeDef(Base):
+    """Registry of trajectory parameter types.  Created automatically by
+    sync_trajectory_type_defs() from column_def candidates."""
+    __tablename__ = "trajectory_type_def"
+    __table_args__ = (UniqueConstraint("parent", "type_name", name="uq_traj_type_def"),)
+    type_def_id  = Column(String, primary_key=True, default=new_uuid)
+    parent       = Column(String, nullable=False)  # "main" | "sub"
+    type_name    = Column(String, nullable=False)  # e.g. "line", "circle"
+    param_table  = Column(String, nullable=False)  # e.g. "line_parameter"
+    pk_col       = Column(String, nullable=False)  # e.g. "line_parameter_id"
 
 
 

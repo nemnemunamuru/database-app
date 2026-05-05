@@ -1,4 +1,5 @@
 import os
+import re
 from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -17,18 +18,27 @@ def er_diagram_live(db: Session = Depends(get_db)):
     """Generate a Mermaid ER diagram from the current column_def table."""
     rows = db.query(ColumnDef).order_by(ColumnDef.table_name, ColumnDef.order_index).all()
 
-    # Group columns by table
+    # Group columns by table (strip table name whitespace)
     tables: dict[str, list[ColumnDef]] = defaultdict(list)
     for r in rows:
-        tables[r.table_name].append(r)
+        tables[r.table_name.strip()].append(r)
 
-    # Collect FK relationships
-    # pk rows define the target table; fk rows in another table reference it
-    pk_columns: dict[str, str] = {}  # column_name → owner table
+    def _safe_id(s: str) -> str:
+        """Sanitize an identifier: strip, collapse whitespace to underscore, remove invalid chars."""
+        s = s.strip()
+        s = re.sub(r"\s+", "_", s)          # internal spaces → _
+        s = re.sub(r"[^\w]", "_", s)        # non-word chars → _
+        s = re.sub(r"_+", "_", s)           # collapse multiple _
+        return s.strip("_") or "unknown"
+
+    # Collect FK relationships using sanitized names
+    # pk_columns maps column_name → list of owner tables (polymorphic: multiple tables share same PK name)
+    pk_columns: dict[str, list[str]] = defaultdict(list)
     for tname, cols in tables.items():
+        safe_tname = _safe_id(tname)
         for c in cols:
             if c.is_id == "pk":
-                pk_columns[c.column_name] = tname
+                pk_columns[_safe_id(c.column_name)].append(safe_tname)
 
     # Special-case: trajectory parameter FKs omit "type" in the column name
     # e.g. FK main_trajectory_parameter_id → PK main_trajectory_type_parameter_id
@@ -37,18 +47,24 @@ def er_diagram_live(db: Session = Depends(get_db)):
         "sub_trajectory_parameter_id":  "sub_trajectory_type_parameter_id",
     }
 
-    def _find_pk_table(fk_col: str) -> str | None:
+    def _find_pk_tables(fk_col: str) -> list[str]:
         resolved = FK_ALIAS.get(fk_col, fk_col)
-        return pk_columns.get(resolved)
+        return pk_columns.get(resolved, [])
 
     lines = ["erDiagram"]
 
     # Entity blocks
     for tname, cols in sorted(tables.items()):
-        lines.append(f"    {tname} {{")
+        safe_tname = _safe_id(tname)
+        lines.append(f"    {safe_tname} {{")
+        seen_attrs: set[str] = set()
         for c in cols:
-            dtype = (c.data_type or "string").strip()
-            cname = (c.column_name or "").strip()
+            dtype = _safe_id(c.data_type or "string")
+            cname = _safe_id(c.column_name or "col")
+            attr_key = f"{dtype}_{cname}"
+            if attr_key in seen_attrs:
+                continue
+            seen_attrs.add(attr_key)
             if c.is_id == "pk":
                 lines.append(f"        {dtype} {cname} PK")
             elif c.is_id == "fk":
@@ -58,17 +74,19 @@ def er_diagram_live(db: Session = Depends(get_db)):
         lines.append("    }")
         lines.append("")
 
-    # Relationship lines (FK → PK owner)
+    # Relationship lines (FK → PK owner, supports polymorphic: one FK → multiple PK tables)
     seen_rels: set[tuple[str, str]] = set()
     for tname, cols in sorted(tables.items()):
+        safe_tname = _safe_id(tname)
         for c in cols:
             if c.is_id == "fk":
-                target = _find_pk_table(c.column_name)
-                if target and target != tname:
-                    key = (tname, target)
-                    if key not in seen_rels:
-                        seen_rels.add(key)
-                        lines.append(f"    {tname} }}o--|| {target} : \"\"")
+                targets = _find_pk_tables(_safe_id(c.column_name))
+                for target in targets:
+                    if target != safe_tname:
+                        key = (safe_tname, target)
+                        if key not in seen_rels:
+                            seen_rels.add(key)
+                            lines.append(f'    {safe_tname} }}o--|| {target} : "ref"')
 
     content = "\n".join(lines)
 

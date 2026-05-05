@@ -5,11 +5,12 @@ import {
 } from "@mui/material";
 import SchemaIcon from "@mui/icons-material/Schema";
 import PaletteIcon from "@mui/icons-material/Palette";
+import SmartToyIcon from "@mui/icons-material/SmartToy";
 import DarkModeIcon from "@mui/icons-material/DarkMode";
 import LightModeIcon from "@mui/icons-material/LightMode";
 import { EntityCrud } from "../components/masters/EntityCrud";
 import type { FieldDef } from "../components/masters/EntityCrud";
-import { columnDefsApi, columnDefsTableApi, deleteFkByColumn, getColumnDef, initColumnDefs, syncFkForColumn } from "../api/masters";
+import { columnDefsApi, columnDefsTableApi, deleteFkByColumn, getColumnDef, initColumnDefs, reorderColumnDefs, syncFkForColumn, trajectoryTypeDefsApi } from "../api/masters";
 
 interface Props {
   darkMode: boolean;
@@ -21,7 +22,7 @@ const COLUMN_DEF_FIELDS: FieldDef[] = [
   { key: "column_name", label: "column_name", type: "text",
     endAdornment: (form) => form.is_id === "id" ? "_id" : undefined },
   { key: "data_type",   label: "data_type",   type: "text",
-    options: ["string", "float", "integer", "boolean", "text", "uuid", "date", "datetime"],
+    options: ["string", "float", "integer", "boolean", "text", "uuid", "date", "datetime", "path"],
     disabledWhen: (form) => form.is_id === "id",
     defaultWhen:  (form) => form.is_id === "id" ? "uuid" : undefined },
   { key: "unit",        label: "unit",        type: "text",
@@ -90,6 +91,15 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
   const [subIdx,   setSubIdx]   = useState(0);
   const [extraTables, setExtraTables] = useState<Array<{ root: string; tables: string[] }>>([]);
   const [schemaKey, setSchemaKey] = useState(0);
+  const [dynParamTables, setDynParamTables] = useState<string[]>([]);
+
+  // Load dynamic trajectory parameter tables
+  useEffect(() => {
+    trajectoryTypeDefsApi.list().then(r => {
+      const tables = r.data.map((d: any) => (d.param_table as string).toUpperCase());
+      setDynParamTables(tables);
+    }).catch(() => {});
+  }, [schemaKey]);
 
   // All tables that belong to any predefined group
   const knownTables = new Set(TABLE_GROUPS.flatMap(g => g.tables as string[]));
@@ -136,13 +146,20 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
     }).catch(() => {});
   }, [schemaKey]);
 
-  // Build the full groups list (static + one group per root extra table)
-  const allGroups = [
-    ...TABLE_GROUPS,
-    ...extraTables.map(({ root, tables }) => ({
-      key: root, label: root, color: getTabColor(root), tables,
-    })),
-  ];
+  // Build the full groups list (static + dynamic trajectory param tables in WELDING + extra groups)
+  const WELDING_STATIC = ["WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER", "SUB_TRAJECTORY", "WOBBLING_PARAMETER"];
+  const knownParamTables = new Set(WELDING_STATIC);
+  const extraParamTables = dynParamTables.filter(t => !knownParamTables.has(t));
+
+  const allGroups = TABLE_GROUPS.map(g =>
+    g.key === "WELDING"
+      ? { ...g, tables: [...g.tables, ...extraParamTables] }
+      : g
+  ).concat(
+    extraTables
+      .filter(({ root }) => !dynParamTables.includes(root))
+      .map(({ root, tables }) => ({ key: root, label: root, color: getTabColor(root), tables }))
+  );
 
   const activeGroup = allGroups[groupIdx] ?? allGroups[0];
   const activeTable = (activeGroup.tables[subIdx] ?? activeGroup.tables[0]) as string;
@@ -238,6 +255,7 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
       <Tabs value={tab} onChange={(_, v) => setTab(v)} sx={{ mb: 3 }}>
         {isAdmin && <Tab label="Columns" icon={<SchemaIcon fontSize="small" />} iconPosition="start" />}
         <Tab label="Color"   icon={<PaletteIcon fontSize="small" />} iconPosition="start" />
+        <Tab label="AI Chatbot" icon={<SmartToyIcon fontSize="small" />} iconPosition="start" />
       </Tabs>
 
       {/* ── Columns ── */}
@@ -300,6 +318,11 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
               fields={COLUMN_DEF_FIELDS}
               pkField="column_def_id"
               api={tableApi}
+              onReorder={async (newItems) => {
+                await reorderColumnDefs(
+                  newItems.map((item, idx) => ({ id: item.column_def_id, order_index: idx }))
+                );
+              }}
             />
           )}
         </Box>
@@ -341,6 +364,20 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
                 {darkMode ? "Dark Mode" : "Light Mode"}
               </Typography>
             </Box>
+          </Paper>
+        </Box>
+      )}
+      {/* ── AI Chatbot ── */}
+      {tab === (isAdmin ? 2 : 1) && (
+        <Box sx={{ maxWidth: 600 }}>
+          <Paper sx={{ p: 3 }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+              <SmartToyIcon color="primary" />
+              <Typography variant="subtitle1" fontWeight="bold">AI Chatbot Settings</Typography>
+            </Box>
+            <Typography variant="body2" color="text.secondary">
+              AI chatbot settings (OpenAI API key, model selection, etc.) are coming soon.
+            </Typography>
           </Paper>
         </Box>
       )}

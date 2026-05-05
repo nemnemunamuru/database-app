@@ -1,12 +1,7 @@
 {
-  "de2ca7cb-93a8-47e3-88f7-bc89ce595071": {
+  "184a1510-1c62-4ff9-9279-ba079e41c8c8": {
     "name": "欠陥推定用",
-    "created_at": "2026-04-30T16:26:10",
-    "db_filename": "de2ca7cb-93a8-47e3-88f7-bc89ce595071_欠陥推定用.db"
-  },
-  "50c8e7f5-b124-43eb-9a80-810750fc0bc0": {
-    "name": "TEST",
-    "created_at": "2026-04-30T16:43:27",
-    "db_filename": "50c8e7f5-b124-43eb-9a80-810750fc0bc0_TEST.db"
+    "created_at": "2026-05-05T10:24:48",
+    "db_filename": "184a1510-1c62-4ff9-9279-ba079e41c8c8_欠陥推定用.db"
   }
 }

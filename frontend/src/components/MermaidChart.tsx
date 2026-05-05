@@ -1,7 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import mermaid from "mermaid";
 import { TransformWrapper, TransformComponent, useControls } from "react-zoom-pan-pinch";
-import { Box, IconButton, Tooltip } from "@mui/material";
+import { Box, IconButton, Tooltip, Typography } from "@mui/material";
 import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import ZoomOutIcon from "@mui/icons-material/ZoomOut";
 import FitScreenIcon from "@mui/icons-material/FitScreen";
@@ -32,17 +32,20 @@ function ZoomControls() {
 
 export default function MermaidChart({ chart, darkMode }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
 
   useEffect(() => {
     mermaid.initialize({
       startOnLoad: false,
       theme: darkMode ? "dark" : "default",
+      suppressErrorRendering: true,   // prevent mermaid from writing errors to document.body
     });
     _initialized = true;
   }, [darkMode]);
 
   useEffect(() => {
     if (!_initialized || !ref.current) return;
+    setRenderError(null);
     const id = `mermaid-${Math.random().toString(36).slice(2)}`;
     mermaid
       .render(id, chart)
@@ -60,13 +63,20 @@ export default function MermaidChart({ chart, darkMode }: Props) {
           svgEl.style.minWidth = "1200px";
         }
       })
-      .catch(console.error);
+      .catch((err: unknown) => {
+        setRenderError(err instanceof Error ? err.message : String(err));
+        // Remove any orphan elements mermaid may have left in the body
+        document.querySelectorAll(`#${id}, [id^="mermaid-"]`).forEach(el => {
+          if (!el.closest("[data-mermaid-chart]")) el.remove();
+        });
+      });
   }, [chart, darkMode]);
 
   const viewerHeight = "calc(100vh - 220px)";
 
   return (
     <Box
+      data-mermaid-chart
       sx={{
         border: 1,
         borderColor: "divider",
@@ -78,27 +88,35 @@ export default function MermaidChart({ chart, darkMode }: Props) {
         flexDirection: "column",
       }}
     >
-      <TransformWrapper
-        minScale={0.1}
-        maxScale={5}
-        wheel={{ step: 0.006 }}
-        doubleClick={{ disabled: false }}
-        centerOnInit
-      >
-        <>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 0.5 }}>
-            <ZoomControls />
-            <small style={{ color: "gray", marginLeft: 8 }}>
-              Scroll to zoom · Drag to pan · Double-click to zoom in
-            </small>
-          </Box>
-          <TransformComponent
-            wrapperStyle={{ width: "100%", flexGrow: 1, overflow: "hidden", cursor: "grab" }}
-          >
-            <div ref={ref} />
-          </TransformComponent>
-        </>
-      </TransformWrapper>
+      {renderError ? (
+        <Box sx={{ p: 2 }}>
+          <Typography color="error" variant="body2" fontFamily="monospace" sx={{ whiteSpace: "pre-wrap" }}>
+            Mermaid render error:{"\n"}{renderError}
+          </Typography>
+        </Box>
+      ) : (
+        <TransformWrapper
+          minScale={0.1}
+          maxScale={5}
+          wheel={{ step: 0.006 }}
+          doubleClick={{ disabled: false }}
+          centerOnInit
+        >
+          <>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 0.5 }}>
+              <ZoomControls />
+              <small style={{ color: "gray", marginLeft: 8 }}>
+                Scroll to zoom · Drag to pan · Double-click to zoom in
+              </small>
+            </Box>
+            <TransformComponent
+              wrapperStyle={{ width: "100%", flexGrow: 1, overflow: "hidden", cursor: "grab" }}
+            >
+              <div ref={ref} />
+            </TransformComponent>
+          </>
+        </TransformWrapper>
+      )}
     </Box>
   );
 }

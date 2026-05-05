@@ -1,9 +1,9 @@
 import uuid
 from fastapi import APIRouter, Body, Depends, HTTPException
-from sqlalchemy import case
+from sqlalchemy import case, text
 from sqlalchemy.orm import Session, joinedload
 
-from backend.database import get_db
+from backend.database import get_db, engine as _main_engine
 from backend.models import (
     Material, MaterialState,
     LaserBeam,
@@ -15,7 +15,7 @@ from backend.models import (
     Result, Observation,
     ExperimentMaterial, File, Experiment,
     Project,
-    ColumnDef, Base,
+    ColumnDef, Base, TrajectoryTypeDef,
 )
 
 router = APIRouter()
@@ -110,6 +110,15 @@ def update_material_state(item_id: str, body: dict = Body(...), db: Session = De
 @router.delete("/material-states/{item_id}", status_code=204)
 def delete_material_state(item_id: str, db: Session = Depends(get_db)):
     _delete_one(MaterialState, "material_state_id", item_id, db)
+
+@router.get("/material-states/{item_id}/detail")
+def get_material_state_detail(item_id: str, db: Session = Depends(get_db)):
+    ms = db.get(MaterialState, item_id)
+    if not ms:
+        raise HTTPException(404)
+    result = _row(ms)
+    result["material"] = _row(db.get(Material, ms.material_id)) if ms.material_id else None
+    return result
 
 
 # ── LaserBeam (flat, composite PK: laser_beam_id + beam_type) ────────────────
@@ -421,6 +430,43 @@ def update_welding_condition(item_id: str, body: dict = Body(...), db: Session =
 def delete_welding_condition(item_id: str, db: Session = Depends(get_db)):
     _delete_one(WeldingCondition, "welding_condition_id", item_id, db)
 
+@router.get("/welding-conditions/{item_id}/detail")
+def get_welding_condition_detail(item_id: str, db: Session = Depends(get_db)):
+    wc = db.get(WeldingCondition, item_id)
+    if not wc:
+        raise HTTPException(404)
+    result = _row(wc)
+    if wc.trajectory_set_id:
+        ts = db.get(TrajectorySet, wc.trajectory_set_id)
+        if ts:
+            ts_data = _row(ts)
+            if ts.main_trajectory_id:
+                mt = db.get(MainTrajectory, ts.main_trajectory_id)
+                if mt:
+                    mt_data = _row(mt)
+                    mt_data["line_parameter"] = _row(db.get(LineParameter, mt.main_trajectory_parameter_id)) if mt.main_trajectory_parameter_id else None
+                    ts_data["main_trajectory"] = mt_data
+                else:
+                    ts_data["main_trajectory"] = None
+            else:
+                ts_data["main_trajectory"] = None
+            if ts.sub_trajectory_id:
+                st = db.get(SubTrajectory, ts.sub_trajectory_id)
+                if st:
+                    st_data = _row(st)
+                    st_data["wobbling_parameter"] = _row(db.get(WobblingParameter, st.sub_trajectory_parameter_id)) if st.sub_trajectory_parameter_id else None
+                    ts_data["sub_trajectory"] = st_data
+                else:
+                    ts_data["sub_trajectory"] = None
+            else:
+                ts_data["sub_trajectory"] = None
+            result["trajectory_set"] = ts_data
+        else:
+            result["trajectory_set"] = None
+    else:
+        result["trajectory_set"] = None
+    return result
+
 
 # ── LineParameter ───────────────────────────────────────────────────────────────
 
@@ -467,6 +513,15 @@ def update_main_trajectory(item_id: str, body: dict = Body(...), db: Session = D
 def delete_main_trajectory(item_id: str, db: Session = Depends(get_db)):
     _delete_one(MainTrajectory, "main_trajectory_id", item_id, db)
 
+@router.get("/main-trajectories/{item_id}/detail")
+def get_main_trajectory_detail(item_id: str, db: Session = Depends(get_db)):
+    mt = db.get(MainTrajectory, item_id)
+    if not mt:
+        raise HTTPException(404)
+    result = _row(mt)
+    result["line_parameter"] = _row(db.get(LineParameter, mt.main_trajectory_parameter_id)) if mt.main_trajectory_parameter_id else None
+    return result
+
 
 # ── WobblingParameter ────────────────────────────────────────────────────────────
 
@@ -512,6 +567,15 @@ def update_sub_trajectory(item_id: str, body: dict = Body(...), db: Session = De
 @router.delete("/sub-trajectories/{item_id}", status_code=204)
 def delete_sub_trajectory(item_id: str, db: Session = Depends(get_db)):
     _delete_one(SubTrajectory, "sub_trajectory_id", item_id, db)
+
+@router.get("/sub-trajectories/{item_id}/detail")
+def get_sub_trajectory_detail(item_id: str, db: Session = Depends(get_db)):
+    st = db.get(SubTrajectory, item_id)
+    if not st:
+        raise HTTPException(404)
+    result = _row(st)
+    result["wobbling_parameter"] = _row(db.get(WobblingParameter, st.sub_trajectory_parameter_id)) if st.sub_trajectory_parameter_id else None
+    return result
 
 
 # ── TrajectorySet ───────────────────────────────────────────────────────────────
@@ -688,7 +752,12 @@ def list_experiment_materials(db: Session = Depends(get_db)):
 
 @router.get("/experiment-materials/{item_id}")
 def get_experiment_material(item_id: str, db: Session = Depends(get_db)):
-    return _get_one(ExperimentMaterial, "experiment_material_id", item_id, db)
+    rows = db.query(ExperimentMaterial).filter(
+        ExperimentMaterial.experiment_material_id == item_id
+    ).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Not found")
+    return [_row(r) for r in rows]
 
 @router.post("/experiment-materials", status_code=201)
 def create_experiment_material(body: dict = Body(...), db: Session = Depends(get_db)):
@@ -696,11 +765,53 @@ def create_experiment_material(body: dict = Body(...), db: Session = Depends(get
 
 @router.put("/experiment-materials/{item_id}")
 def update_experiment_material(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(ExperimentMaterial, "experiment_material_id", item_id, body, db)
+    # body must contain material_role to identify the specific row
+    role = body.get("material_role")
+    if not role:
+        raise HTTPException(status_code=422, detail="material_role is required")
+    item = db.get(ExperimentMaterial, (item_id, role))
+    if not item:
+        raise HTTPException(status_code=404, detail="Not found")
+    for k, v in body.items():
+        if k not in ("experiment_material_id", "material_role") and hasattr(item, k):
+            setattr(item, k, v)
+    db.commit()
+    db.refresh(item)
+    return _row(item)
 
 @router.delete("/experiment-materials/{item_id}", status_code=204)
 def delete_experiment_material(item_id: str, db: Session = Depends(get_db)):
-    _delete_one(ExperimentMaterial, "experiment_material_id", item_id, db)
+    rows = db.query(ExperimentMaterial).filter(
+        ExperimentMaterial.experiment_material_id == item_id
+    ).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Not found")
+    for r in rows:
+        db.delete(r)
+    db.commit()
+
+@router.get("/experiment-materials/{item_id}/detail")
+def get_experiment_material_detail(item_id: str, db: Session = Depends(get_db)):
+    rows = db.query(ExperimentMaterial).filter(
+        ExperimentMaterial.experiment_material_id == item_id
+    ).all()
+    if not rows:
+        raise HTTPException(404)
+    result = []
+    for em in rows:
+        em_data = _row(em)
+        if em.material_state_id:
+            ms = db.get(MaterialState, em.material_state_id)
+            if ms:
+                ms_data = _row(ms)
+                ms_data["material"] = _row(db.get(Material, ms.material_id)) if ms.material_id else None
+                em_data["material_state"] = ms_data
+            else:
+                em_data["material_state"] = None
+        else:
+            em_data["material_state"] = None
+        result.append(em_data)
+    return result
 
 
 # ── Experiment ───────────────────────────────────────────────────────────────
@@ -802,6 +913,17 @@ def sync_fk_for_column(column_name: str, db: Session = Depends(get_db)):
     return {"updated": len(rows)}
 
 
+@router.post("/column-defs/reorder", status_code=200)
+def reorder_column_defs(body: list = Body(...), db: Session = Depends(get_db)):
+    """Bulk update order_index. Body: [{id, order_index}, ...]"""
+    for item in body:
+        row = db.get(ColumnDef, item["id"])
+        if row:
+            row.order_index = item["order_index"]
+    db.commit()
+    return {"updated": len(body)}
+
+
 @router.post("/column-defs", status_code=201)
 def create_column_def(body: dict = Body(...), db: Session = Depends(get_db)):
     return _create_one(ColumnDef, "column_def_id", body, db)
@@ -824,9 +946,189 @@ def delete_fk_by_column(column_name: str, db: Session = Depends(get_db)):
 
 @router.put("/column-defs/{item_id}")
 def update_column_def(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
-    return _update_one(ColumnDef, "column_def_id", item_id, body, db)
+    result = _update_one(ColumnDef, "column_def_id", item_id, body, db)
+    # Re-sync trajectory types when trajectory_type candidates change
+    row = db.get(ColumnDef, item_id)
+    if row and row.column_name in ("main_trajectory_type", "sub_trajectory_type"):
+        sync_trajectory_type_defs(db)
+    return result
 
 
 @router.delete("/column-defs/{item_id}", status_code=204)
 def delete_column_def(item_id: str, db: Session = Depends(get_db)):
     _delete_one(ColumnDef, "column_def_id", item_id, db)
+
+
+# ── Trajectory type defs ──────────────────────────────────────────────────────
+
+# Built-in types that use legacy table/pk names (existing tables keep their names)
+_TRAJ_BUILTINS: dict[tuple[str, str], tuple[str, str]] = {
+    ("main", "line"):     ("line_parameter",     "main_trajectory_type_parameter_id"),
+    ("sub",  "wobbling"): ("wobbling_parameter",  "sub_trajectory_type_parameter_id"),
+}
+
+
+def _parse_candidates(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    parts = raw.replace("|", "/").split("/")
+    return [p.split(";;")[0].strip() for p in parts if p.strip()]
+
+
+def sync_trajectory_type_defs(db: Session) -> None:
+    """Ensure trajectory_type_def table is populated from column_def candidates
+    and that the corresponding parameter tables exist in the DB."""
+    Base.metadata.create_all(bind=_main_engine, tables=[TrajectoryTypeDef.__table__])
+
+    for parent, col_table, col_col in [
+        ("main", "MAIN_TRAJECTORY", "main_trajectory_type"),
+        ("sub",  "SUB_TRAJECTORY",  "sub_trajectory_type"),
+    ]:
+        row = db.execute(
+            text("SELECT candidates FROM column_def WHERE table_name=:t AND column_name=:c"),
+            {"t": col_table, "c": col_col},
+        ).fetchone()
+        if not row or not row[0]:
+            continue
+        for type_name in _parse_candidates(row[0]):
+            exists = db.execute(
+                text("SELECT 1 FROM trajectory_type_def WHERE parent=:p AND type_name=:n"),
+                {"p": parent, "n": type_name},
+            ).fetchone()
+            if exists:
+                continue
+            builtin = _TRAJ_BUILTINS.get((parent, type_name))
+            if builtin:
+                param_table, pk_col = builtin
+            else:
+                param_table = f"{type_name}_parameter"
+                pk_col      = f"{type_name}_parameter_id"
+            # Create parameter table if missing
+            db.execute(text(
+                f'CREATE TABLE IF NOT EXISTS "{param_table}" '
+                f'("{pk_col}" TEXT PRIMARY KEY, remarks TEXT)'
+            ))
+            db.commit()
+            db.execute(
+                text(
+                    "INSERT OR IGNORE INTO trajectory_type_def "
+                    "(type_def_id, parent, type_name, param_table, pk_col) "
+                    "VALUES (:id, :p, :n, :tbl, :pk)"
+                ),
+                {"id": str(uuid.uuid4()), "p": parent, "n": type_name,
+                 "tbl": param_table, "pk": pk_col},
+            )
+    db.commit()
+
+
+@router.get("/trajectory-type-defs")
+def list_trajectory_type_defs(db: Session = Depends(get_db)):
+    Base.metadata.create_all(bind=_main_engine, tables=[TrajectoryTypeDef.__table__])
+    rows = db.query(TrajectoryTypeDef).order_by(
+        TrajectoryTypeDef.parent, TrajectoryTypeDef.type_name
+    ).all()
+    return [_row(r) for r in rows]
+
+
+@router.post("/trajectory-type-defs/sync", status_code=200)
+def trigger_sync(db: Session = Depends(get_db)):
+    sync_trajectory_type_defs(db)
+    return {"status": "ok"}
+
+
+# ── Generic dynamic parameter table CRUD ─────────────────────────────────────
+# Endpoint slug uses hyphens (e.g. circle-parameter → circle_parameter table)
+
+def _slug_to_table(slug: str) -> str:
+    return slug.replace("-", "_")
+
+
+@router.get("/dyn-params/{slug}")
+def list_dyn_params(slug: str, db: Session = Depends(get_db)):
+    table = _slug_to_table(slug)
+    rows = db.execute(text(f'SELECT * FROM "{table}"')).fetchall()
+    if not rows:
+        return []
+    keys = list(rows[0]._fields)
+    return [dict(zip(keys, r)) for r in rows]
+
+
+@router.get("/dyn-params/{slug}/{item_id}")
+def get_dyn_param(slug: str, item_id: str, db: Session = Depends(get_db)):
+    table = _slug_to_table(slug)
+    rows = db.execute(text(f'SELECT * FROM "{table}"')).fetchall()
+    if not rows:
+        raise HTTPException(404, "Not found")
+    keys = list(rows[0]._fields)
+    for r in rows:
+        d = dict(zip(keys, r))
+        if str(list(d.values())[0]) == item_id:
+            return d
+    raise HTTPException(404, "Not found")
+
+
+@router.post("/dyn-params/{slug}", status_code=201)
+def create_dyn_param(slug: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    table = _slug_to_table(slug)
+    # Determine PK col
+    tdef = db.execute(
+        text("SELECT pk_col FROM trajectory_type_def WHERE param_table=:t"),
+        {"t": table},
+    ).fetchone()
+    if not tdef:
+        raise HTTPException(400, f"Unknown trajectory param table: {table}")
+    pk_col = tdef[0]
+    body.pop(pk_col, None)
+    new_id = str(uuid.uuid4())
+    cols = [pk_col] + [k for k in body if k != pk_col]
+    placeholders = ", ".join(f":{c}" for c in cols)
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    params = {pk_col: new_id, **{k: v for k, v in body.items() if k != pk_col}}
+    db.execute(text(f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'), params)
+    db.commit()
+    row = db.execute(
+        text(f'SELECT * FROM "{table}" WHERE "{pk_col}"=:id'), {"id": new_id}
+    ).fetchone()
+    return dict(zip(row._fields, row))
+
+
+@router.put("/dyn-params/{slug}/{item_id}")
+def update_dyn_param(slug: str, item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    table = _slug_to_table(slug)
+    tdef = db.execute(
+        text("SELECT pk_col FROM trajectory_type_def WHERE param_table=:t"),
+        {"t": table},
+    ).fetchone()
+    if not tdef:
+        raise HTTPException(400, f"Unknown trajectory param table: {table}")
+    pk_col = tdef[0]
+    sets = ", ".join(f'"{k}"=:{k}' for k in body if k != pk_col)
+    if not sets:
+        raise HTTPException(400, "Nothing to update")
+    params = {"__id": item_id, **{k: v for k, v in body.items() if k != pk_col}}
+    db.execute(
+        text(f'UPDATE "{table}" SET {sets} WHERE "{pk_col}"=:__id'), params
+    )
+    db.commit()
+    row = db.execute(
+        text(f'SELECT * FROM "{table}" WHERE "{pk_col}"=:id'), {"id": item_id}
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Not found")
+    return dict(zip(row._fields, row))
+
+
+@router.delete("/dyn-params/{slug}/{item_id}", status_code=204)
+def delete_dyn_param(slug: str, item_id: str, db: Session = Depends(get_db)):
+    table = _slug_to_table(slug)
+    tdef = db.execute(
+        text("SELECT pk_col FROM trajectory_type_def WHERE param_table=:t"),
+        {"t": table},
+    ).fetchone()
+    if not tdef:
+        raise HTTPException(400, f"Unknown trajectory param table: {table}")
+    pk_col = tdef[0]
+    db.execute(
+        text(f'DELETE FROM "{table}" WHERE "{pk_col}"=:id'), {"id": item_id}
+    )
+    db.commit()

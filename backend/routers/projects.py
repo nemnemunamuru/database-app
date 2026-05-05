@@ -132,6 +132,11 @@ def _project_session(project_id: str) -> Session:
             conn.execute(text("ALTER TABLE experiment ADD COLUMN project_id TEXT"))
             conn.commit()
             cols.add("project_id")
+        # Add remarks to project table if missing
+        proj_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(project)"))}
+        if "remarks" not in proj_cols:
+            conn.execute(text("ALTER TABLE project ADD COLUMN remarks TEXT"))
+            conn.commit()
         # Sync custom columns from main DB's column_defs
         try:
             from backend.database import _migrate_experiment_custom_cols, SessionLocal as _MainSession
@@ -152,6 +157,12 @@ def _project_session(project_id: str) -> Session:
                     cols.add(col_name)
         except Exception:
             pass
+        # Ensure project_setting KV table exists
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS project_setting "
+            "(key TEXT PRIMARY KEY, value TEXT)"
+        ))
+        conn.commit()
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)()
 
 
@@ -191,12 +202,17 @@ def list_projects():
 
 class CreateProjectRequest(BaseModel):
     name: str
+    project_id: str | None = None  # if provided, preserve the original ID
 
 
 @router.post("")
 def create_project(req: CreateProjectRequest):
     _ensure_dir()
-    project_id = str(uuid.uuid4())
+    project_id = req.project_id if req.project_id else str(uuid.uuid4())
+    # Duplicate check
+    manifest = _load_manifest()
+    if project_id in manifest:
+        raise HTTPException(409, f"プロジェクト ID '{project_id[:8]}…' は既に存在します")
     db_filename = _make_db_filename(project_id, req.name)
     db_path = os.path.join(PROJECTS_DIR, db_filename)
 
@@ -412,9 +428,9 @@ def delete_project_experiment(project_id: str, experiment_id: str):
 
 # ── Merge project into main DB ────────────────────────────────────────────────
 
-@router.post("/{project_id}/merge")
-def merge_project(project_id: str):
-    """Merge all records from the project DB into the main DB (skip existing PKs)."""
+@router.get("/{project_id}/merge/preview")
+def merge_preview(project_id: str):
+    """Return a diff of experiment rows that already exist in main DB but differ."""
     import sqlite3 as _sqlite3
 
     manifest = _load_manifest()
@@ -424,6 +440,69 @@ def merge_project(project_id: str):
     if not os.path.exists(db_path):
         raise HTTPException(404, "Project DB file not found")
 
+    from backend.database import SessionLocal
+
+    main_db: Session = SessionLocal()
+    try:
+        src_conn = _sqlite3.connect(db_path)
+        src_conn.row_factory = _sqlite3.Row
+        src_cur = src_conn.cursor()
+
+        src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='experiment'")
+        if not src_cur.fetchone():
+            return {"conflicts": [], "new_count": 0}
+
+        src_cur.execute("SELECT * FROM experiment")
+        src_rows = [dict(r) for r in src_cur.fetchall()]
+        src_conn.close()
+
+        col_names = {c.name for c in Experiment.__table__.columns}
+        conflicts = []
+        new_count = 0
+
+        for row in src_rows:
+            exp_id = row.get("experiment_id")
+            if not exp_id:
+                continue
+            existing = main_db.get(Experiment, exp_id)
+            if existing is None:
+                new_count += 1
+                continue
+            # Compare columns
+            main_row = {c: getattr(existing, c) for c in col_names}
+            src_filtered = {k: v for k, v in row.items() if k in col_names}
+            diffs = {}
+            for col in col_names:
+                main_val = main_row.get(col)
+                src_val = src_filtered.get(col)
+                if str(main_val) != str(src_val):
+                    diffs[col] = {"main": main_val, "project": src_val}
+            if diffs:
+                conflicts.append({
+                    "experiment_id": exp_id,
+                    "diffs": diffs,
+                })
+
+        return {"conflicts": conflicts, "new_count": new_count}
+    finally:
+        main_db.close()
+
+
+@router.post("/{project_id}/merge")
+def merge_project(project_id: str, body: dict = Body(default={})):
+    """Merge all records from the project DB into the main DB.
+    If body contains overwrite_ids=[...], those experiment IDs will be updated (not skipped).
+    """
+    import sqlite3 as _sqlite3
+
+    manifest = _load_manifest()
+    if project_id not in manifest:
+        raise HTTPException(404, f"Project '{project_id}' not found")
+    db_path = _db_path(project_id)
+    if not os.path.exists(db_path):
+        raise HTTPException(404, "Project DB file not found")
+
+    overwrite_ids: set[str] = set(body.get("overwrite_ids", []))
     proj_name = manifest[project_id].get("name", project_id)
 
     from backend.database import SessionLocal
@@ -448,20 +527,28 @@ def merge_project(project_id: str):
                 (model.__tablename__,),
             )
             if not src_cur.fetchone():
-                results[table_name] = {"inserted": 0, "skipped": 0, "note": "not in source"}
+                results[table_name] = {"inserted": 0, "skipped": 0, "updated": 0, "note": "not in source"}
                 continue
 
             src_cur.execute(f"SELECT * FROM {model.__tablename__}")
             src_rows = [dict(r) for r in src_cur.fetchall()]
-            inserted = skipped = 0
+            inserted = skipped = updated = 0
+            col_names = {c.name for c in model.__table__.columns}
             for row in src_rows:
                 pk_val = row.get(pk_field)
-                if pk_val and main_db.get(model, str(pk_val)):
-                    skipped += 1
+                existing = main_db.get(model, str(pk_val)) if pk_val else None
+                if existing:
+                    # Overwrite only if explicitly requested (experiment table only)
+                    if model is Experiment and str(pk_val) in overwrite_ids:
+                        filtered = {k: v for k, v in row.items() if k in col_names}
+                        filtered["project_id"] = project_id
+                        for k, v in filtered.items():
+                            setattr(existing, k, v)
+                        updated += 1
+                    else:
+                        skipped += 1
                     continue
-                col_names = {c.name for c in model.__table__.columns}
                 filtered = {k: v for k, v in row.items() if k in col_names}
-                # For EXPERIMENT rows: always stamp project_id
                 if model is Experiment:
                     filtered["project_id"] = project_id
                 try:
@@ -473,9 +560,9 @@ def merge_project(project_id: str):
                 main_db.commit()
             except Exception:
                 main_db.rollback()
-                skipped += inserted
-                inserted = 0
-            results[table_name] = {"inserted": inserted, "skipped": skipped}
+                skipped += inserted + updated
+                inserted = updated = 0
+            results[table_name] = {"inserted": inserted, "skipped": skipped, "updated": updated}
 
         src_conn.close()
     finally:
@@ -574,13 +661,23 @@ def get_experiment_deep(project_id: str, experiment_id: str):
                 ts["sub_trajectory"] = st
             wc["trajectory_set"] = ts
 
-        # experiment_material branch
-        em = fetch(ExperimentMaterial, exp_row.get("experiment_material_id"))
-        if em:
-            ms = fetch(MaterialState, em.get("material_state_id"))
-            if ms:
-                ms["material"] = fetch(Material, ms.get("material_id"))
-            em["material_state"] = ms
+        # experiment_material branch — composite PK (id, role), may have multiple rows
+        em_id = exp_row.get("experiment_material_id")
+        em_list = []
+        if em_id:
+            rows_proj = proj_db2.query(ExperimentMaterial).filter(
+                ExperimentMaterial.experiment_material_id == em_id
+            ).all()
+            rows_main = main_db.query(ExperimentMaterial).filter(
+                ExperimentMaterial.experiment_material_id == em_id
+            ).all() if not rows_proj else []
+            for em_row in (rows_proj or rows_main):
+                em_data = {c.name: getattr(em_row, c.name) for c in em_row.__table__.columns}
+                ms = fetch(MaterialState, em_data.get("material_state_id"))
+                if ms:
+                    ms["material"] = fetch(Material, ms.get("material_id"))
+                em_data["material_state"] = ms
+                em_list.append(em_data)
 
         # project branch
         proj_id = exp_row.get("project_id") or project_id
@@ -595,7 +692,7 @@ def get_experiment_deep(project_id: str, experiment_id: str):
             "experiment": exp_row,
             "galvano_system": gs,
             "welding_condition": wc,
-            "experiment_material": em,
+            "experiment_material": em_list,
             "shielding_condition": fetch(ShieldingCondition, exp_row.get("shielding_condition_id")),
             "result": fetch(Result, exp_row.get("result_id")),
             "observation": fetch(Observation, exp_row.get("observation_id")),
@@ -1014,3 +1111,37 @@ def export_project_report_md(project_id: str):
         media_type="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"},
     )
+
+
+# ── Per-project settings (stored in project's own DB) ────────────────────────
+
+@router.get("/{project_id}/settings/{key}")
+def get_project_setting(project_id: str, key: str):
+    """Return a KV setting stored in the project's own DB."""
+    db = _project_session(project_id)
+    try:
+        row = db.execute(
+            text("SELECT value FROM project_setting WHERE key = :key"),
+            {"key": key},
+        ).fetchone()
+        return {"key": key, "value": row[0] if row else None}
+    finally:
+        db.close()
+
+
+@router.put("/{project_id}/settings/{key}")
+def put_project_setting(project_id: str, key: str, body: dict = Body(...)):
+    """Upsert a KV setting in the project's own DB."""
+    db = _project_session(project_id)
+    try:
+        db.execute(
+            text(
+                "INSERT INTO project_setting (key, value) VALUES (:key, :value) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            ),
+            {"key": key, "value": body.get("value")},
+        )
+        db.commit()
+        return {"key": key, "value": body.get("value")}
+    finally:
+        db.close()

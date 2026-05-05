@@ -1,3 +1,5 @@
+import csv
+import os
 import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -64,6 +66,7 @@ _STANDARD_EXP_COLS = frozenset({
     "experiment_id", "galvano_system_id", "welding_condition_id",
     "experiment_material_id", "shielding_condition_id",
     "result_id", "observation_id", "file_id", "project_id", "remarks",
+    "created_datetime", "updated_datetime",
 })
 
 
@@ -111,6 +114,50 @@ def list_experiments(
     result = [_to_dict(e) for e in items]
     _add_custom_cols(result, [e.experiment_id for e in items], db)
     return {"total": total, "items": result}
+
+
+# ── Log file endpoints (must be before /{experiment_id} to avoid shadowing) ───
+
+_LOG_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "data")
+)
+
+
+@router.get("/logs")
+def list_log_files():
+    """Return sorted list of .log filenames in the data directory."""
+    if not os.path.isdir(_LOG_DIR):
+        return []
+    return sorted(f for f in os.listdir(_LOG_DIR) if f.endswith(".log"))
+
+
+@router.get("/logs/{filename}")
+def get_log_file(
+    filename: str,
+    downsample: int = Query(default=1, ge=1, le=1000),
+):
+    """Parse a CSV-style log file and return rows as a list of dicts.
+    Pass downsample=N to return every N-th row for performance."""
+    # Prevent path traversal
+    if any(c in filename for c in ("..", "/", "\\")):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = os.path.join(_LOG_DIR, filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Log file not found")
+
+    with open(path, encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        headers = next(reader, [])
+        rows: list[dict] = []
+        for i, raw in enumerate(reader):
+            if i % downsample != 0:
+                continue
+            try:
+                rows.append({h: float(v) for h, v in zip(headers, raw)})
+            except ValueError:
+                pass
+
+    return {"headers": headers, "rows": rows}
 
 
 @router.get("/{experiment_id}")
@@ -191,7 +238,7 @@ def get_experiment_detail(experiment_id: str, db: Session = Depends(get_db)):
                 .joinedload(TrajectorySet.main_trajectory).joinedload(MainTrajectory.line_parameter),
             joinedload(Experiment.welding_condition).joinedload(WeldingCondition.trajectory_set)
                 .joinedload(TrajectorySet.sub_trajectory).joinedload(SubTrajectory.wobbling_parameter),
-            joinedload(Experiment.experiment_material).joinedload(ExperimentMaterial.material_state)
+            joinedload(Experiment.experiment_materials).joinedload(ExperimentMaterial.material_state)
                 .joinedload(MaterialState.material),
             joinedload(Experiment.shielding_condition),
             joinedload(Experiment.result),
@@ -219,14 +266,16 @@ def _to_dict(exp: Experiment) -> dict:
         "file_id": exp.file_id,
         "project_id": exp.project_id,
         "project_name": proj.project_name if proj else None,
+        "project_remarks": proj.remarks if proj else None,
         "remarks": exp.remarks,
+        "created_datetime": exp.created_datetime,
+        "updated_datetime": exp.updated_datetime,
     }
 
 
 def _to_detail(exp: Experiment, db) -> dict:
     gs = exp.galvano_system
     wc = exp.welding_condition
-    em = exp.experiment_material
     sc = exp.shielding_condition
     res = exp.result
     obs = exp.observation
@@ -248,6 +297,8 @@ def _to_detail(exp: Experiment, db) -> dict:
                         case((LaserBeam.beam_type == "single", 0), (LaserBeam.beam_type == "ring", 1), (LaserBeam.beam_type == "multi", 2), else_=9)
                     ).all() if ld.laser_beam_id else []
                     ld_data = {
+                        "laser_device_id": ld.laser_device_id,
+                        "laser_beam_id": ld.laser_beam_id,
                         "manufacturer": ld.manufacturer,
                         "model_name": ld.model_name,
                         "serial_number": ld.serial_number,
@@ -269,11 +320,14 @@ def _to_detail(exp: Experiment, db) -> dict:
                 optics_list.append({
                     "optics_id": o.optics_id,
                     "optics_role": o.optics_role,
+                    "laser_device_id": o.laser_device_id,
+                    "doe_id": o.doe_id,
                     "manufacturer": o.manufacturer,
                     "collimator_focal_mm": o.collimator_focal_mm,
                     "serial_number": o.serial_number,
                     "remarks": o.remarks,
                     "doe": {
+                        "doe_id": doe.doe_id,
                         "manufacturer": doe.manufacturer,
                         "model_name": doe.model_name,
                         "serial_number": doe.serial_number,
@@ -283,6 +337,8 @@ def _to_detail(exp: Experiment, db) -> dict:
                     "laser_device": ld_data,
                 })
         galvano = {
+            "galvano_system_id": gs.galvano_system_id,
+            "optics_id": gs.optics_id,
             "galvano_type": gs.galvano_type,
             "serial_number": gs.serial_number,
             "main_diameter_um": gs.main_diameter_um,
@@ -290,6 +346,7 @@ def _to_detail(exp: Experiment, db) -> dict:
             "oct_diameter_um": gs.oct_diameter_um,
             "remarks": gs.remarks,
             "ftheta": {
+                "ftheta_id": ftheta.ftheta_id,
                 "manufacturer": ftheta.manufacturer,
                 "model_name": ftheta.model_name,
                 "serial_number": ftheta.serial_number,
@@ -297,6 +354,7 @@ def _to_detail(exp: Experiment, db) -> dict:
                 "remarks": ftheta.remarks,
             } if ftheta else None,
             "optics": optics_list,
+            "optics_rows": optics_list,
         }
 
     welding = None
@@ -310,9 +368,12 @@ def _to_detail(exp: Experiment, db) -> dict:
             if mt:
                 lp = mt.line_parameter
                 mt_data = {
+                    "main_trajectory_id": mt.main_trajectory_id,
+                    "main_trajectory_parameter_id": mt.main_trajectory_parameter_id,
                     "main_trajectory_type": mt.main_trajectory_type,
                     "remarks": mt.remarks,
                     "line_parameter": {
+                        "main_trajectory_type_parameter_id": lp.main_trajectory_type_parameter_id,
                         "length_mm": lp.length_mm,
                         "remarks": lp.remarks,
                     } if lp else None,
@@ -321,9 +382,12 @@ def _to_detail(exp: Experiment, db) -> dict:
             if st:
                 wp = st.wobbling_parameter
                 st_data = {
+                    "sub_trajectory_id": st.sub_trajectory_id,
+                    "sub_trajectory_parameter_id": st.sub_trajectory_parameter_id,
                     "sub_trajectory_type": st.sub_trajectory_type,
                     "remarks": st.remarks,
                     "wobbling_parameter": {
+                        "sub_trajectory_type_parameter_id": wp.sub_trajectory_type_parameter_id,
                         "wobble_radius_mm": wp.wobble_radius_mm,
                         "wobble_frequency_hz": wp.wobble_frequency_hz,
                         "circumferential_speed": wp.circumferential_speed,
@@ -331,12 +395,17 @@ def _to_detail(exp: Experiment, db) -> dict:
                     } if wp else None,
                 }
             ts_data = {
+                "trajectory_set_id": ts.trajectory_set_id,
+                "main_trajectory_id": ts.main_trajectory_id,
+                "sub_trajectory_id": ts.sub_trajectory_id,
                 "trajectory_csv_path": ts.trajectory_csv_path,
                 "remarks": ts.remarks,
                 "main_trajectory": mt_data,
                 "sub_trajectory": st_data,
             }
         welding = {
+            "welding_condition_id": wc.welding_condition_id,
+            "trajectory_set_id": wc.trajectory_set_id,
             "main_power_w": wc.main_power_w,
             "sub_power_w": wc.sub_power_w,
             "welding_speed_mm_s": wc.welding_speed_mm_s,
@@ -346,20 +415,26 @@ def _to_detail(exp: Experiment, db) -> dict:
             "trajectory_set": ts_data,
         }
 
-    material = None
-    if em:
+    em_list = exp.experiment_materials
+    material = []
+    for em in em_list:
         ms = em.material_state
         mat = ms.material if ms else None
-        material = {
+        material.append({
+            "experiment_material_id": em.experiment_material_id,
+            "material_state_id": em.material_state_id,
             "material_role": em.material_role,
             "remarks": em.remarks,
             "material_state": {
+                "material_state_id": ms.material_state_id,
+                "material_id": ms.material_id,
                 "thickness_mm": ms.thickness_mm,
                 "width_mm": ms.width_mm,
                 "length_mm": ms.length_mm,
                 "surface_condition": ms.surface_condition,
                 "remarks": ms.remarks,
                 "material": {
+                    "material_id": mat.material_id,
                     "material_name": mat.material_name,
                     "material_class": mat.material_class,
                     "density_kg_m3": mat.density_kg_m3,
@@ -368,7 +443,7 @@ def _to_detail(exp: Experiment, db) -> dict:
                     "remarks": mat.remarks,
                 } if mat else None,
             } if ms else None,
-        }
+        })
 
     shielding = None
     if sc:
@@ -415,8 +490,15 @@ def _to_detail(exp: Experiment, db) -> dict:
 
     base = _to_dict(exp)
     _add_custom_cols([base], [exp.experiment_id], db)
+
+    # Build project sub-object with all model columns (enables dynamic display in frontend)
+    proj_data = None
+    if exp.project:
+        proj_data = {c.name: getattr(exp.project, c.name) for c in exp.project.__table__.columns}
+
     return {
         **base,
+        "project": proj_data,
         "galvano_system": galvano,
         "welding_condition": welding,
         "experiment_material": material,
@@ -425,3 +507,6 @@ def _to_detail(exp: Experiment, db) -> dict:
         "observation": observation,
         "file": file_data,
     }
+
+
+

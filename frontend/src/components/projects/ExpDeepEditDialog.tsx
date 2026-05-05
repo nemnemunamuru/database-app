@@ -6,25 +6,56 @@
  * On Save, dirty nodes are written bottom-up as new records in the project DB,
  * and parent FK IDs are updated to point to the new children.
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Accordion, AccordionDetails, AccordionSummary,
   Box, Button, Checkbox, Chip, CircularProgress,
   Dialog, DialogActions, DialogContent, DialogTitle,
-  FormControlLabel, Grid, TextField, Tooltip, Typography,
+  Divider, FormControl, FormControlLabel, Grid, InputLabel,
+  MenuItem, Select, TextField, Tooltip, Typography,
 } from "@mui/material";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import FiberNewIcon from "@mui/icons-material/FiberNew";
+import EditIcon from "@mui/icons-material/Edit";
 import api from "../../api/client";
 import type { ProjectExperiment } from "../../api/projects";
 import { projectsApi } from "../../api/projects";
+import { fetchExperimentDetail, createExperiment, updateExperiment } from "../../api/experiments";
+import type { Experiment } from "../../api/experiments";
+import { IdPickerDialog } from "../common/IdPickerDialog";
+import { columnDefsTableApi, trajectoryTypeDefsApi, dynParamsApi } from "../../api/masters";
+import type { TrajectoryTypeDef } from "../../api/masters";
+
+// Table name → main DB API path (used in main-mode record creation)
+const MAIN_CREATE_PATH: Record<string, string> = {
+  galvano_system:      "galvano-systems",
+  ftheta:              "ftheta",
+  optics:              "optics",
+  laser_device:        "laser-devices",
+  laser_beam:          "laser-beams",
+  doe:                 "doe",
+  welding_condition:   "welding-conditions",
+  trajectory_set:      "trajectory-sets",
+  main_trajectory:     "main-trajectories",
+  line_parameter:      "line-parameters",
+  sub_trajectory:      "sub-trajectories",
+  wobbling_parameter:  "wobbling-parameters",
+  experiment_material: "experiment-materials",
+  material_state:      "material-states",
+  material:            "materials",
+  shielding_condition: "shielding-conditions",
+  result:              "results",
+  observation:         "observations",
+  file:                "files",
+  project:             "projects",
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-type FType = "string" | "number" | "boolean" | "text";
-interface Field { key: string; label: string; type: FType }
+type FType = "string" | "number" | "boolean" | "text" | "date" | "datetime";
+interface Field { key: string; label: string; type: FType; options?: string[] }
 
 // A node in the edit tree
 interface NodeDef {
@@ -187,10 +218,12 @@ const NODE_DEFS: Record<string, NodeDef> = {
   experiment_material: {
     key: "experiment_material", label: "Experiment Material",
     table: "experiment_material", pkField: "experiment_material_id",
+    isArray: true,
     children: ["material_state"],
     fields: [
-      { key: "material_role", label: "material_role", type: "string" },
-      { key: "remarks",       label: "remarks",       type: "text" },
+      { key: "material_role",   label: "material_role",   type: "string" },
+      { key: "material_state_id", label: "material_state_id", type: "string" },
+      { key: "remarks",         label: "remarks",         type: "text" },
     ],
   },
   material_state: {
@@ -259,7 +292,7 @@ const NODE_DEFS: Record<string, NodeDef> = {
     table: "observation", pkField: "observation_id",
     fields: [
       { key: "observer_name",        label: "observer_name",        type: "string" },
-      { key: "observation_datetime", label: "observation_datetime", type: "string" },
+      { key: "observation_datetime", label: "observation_datetime", type: "date" },
       { key: "comment",              label: "comment",              type: "text" },
       { key: "remarks",              label: "remarks",              type: "text" },
     ],
@@ -292,6 +325,18 @@ const TOP_BRANCHES: Array<{ nodeKey: string; expFk: keyof ProjectExperiment }> =
   { nodeKey: "project",             expFk: "project_id" },
 ];
 
+// Sub-node → parent FK mapping (used to change a child's referenced record)
+const SUB_NODE_PARENT: Record<string, { parentKey: string; fkField: string }> = {
+  ftheta:             { parentKey: "galvano_system",      fkField: "ftheta_id" },
+  trajectory_set:     { parentKey: "welding_condition",   fkField: "trajectory_set_id" },
+  main_trajectory:    { parentKey: "trajectory_set",      fkField: "main_trajectory_id" },
+  line_parameter:     { parentKey: "main_trajectory",     fkField: "main_trajectory_parameter_id" },
+  sub_trajectory:     { parentKey: "trajectory_set",      fkField: "sub_trajectory_id" },
+  wobbling_parameter: { parentKey: "sub_trajectory",      fkField: "sub_trajectory_parameter_id" },
+  material_state:     { parentKey: "experiment_material", fkField: "material_state_id" },
+  material:           { parentKey: "material_state",      fkField: "material_id" },
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Node state (keyed by nodeKey, or nodeKey+"_"+index for array rows)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,7 +349,7 @@ interface NodeState {
   data: Record<string, unknown>;
   dirty: boolean;
   /** for array nodes: all rows */
-  rows?: Array<{ original: Record<string, unknown>; data: Record<string, unknown>; dirty: boolean }>;
+  rows?: Array<{ original: Record<string, unknown>; data: Record<string, unknown>; dirty: boolean; nestedDirty?: boolean }>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -325,7 +370,7 @@ function FieldGrid({
         const raw = data[f.key];
         if (f.type === "boolean") {
           return (
-            <Grid item xs={12} sm={6} key={f.key}>
+            <Grid size={{ xs: 12, sm: 6 }} key={f.key}>
               <FormControlLabel
                 control={
                   <Checkbox size="small" checked={!!raw}
@@ -336,8 +381,61 @@ function FieldGrid({
             </Grid>
           );
         }
+        if (f.type === "date" || f.type === "datetime") {
+          const isDatetime = f.type === "datetime";
+          const rawStr = raw != null ? String(raw) : "";
+          let inputVal = "";
+          if (rawStr) {
+            const base = rawStr.slice(0, 10).replace(/\//g, "-");
+            if (isDatetime) {
+              const time = rawStr.length >= 16 ? rawStr.slice(11, 16).replace(/\//g, ":") : "00:00";
+              inputVal = `${base}T${time}`;
+            } else {
+              inputVal = base;
+            }
+          }
+          return (
+            <Grid size={{ xs: 12, sm: 6 }} key={f.key}>
+              <TextField
+                fullWidth size="small" label={f.label}
+                type={isDatetime ? "datetime-local" : "date"}
+                value={inputVal}
+                InputLabelProps={{ shrink: true }}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) { onChange(f.key, null); return; }
+                  if (isDatetime) {
+                    const [datePart, timePart = "00:00"] = v.split("T");
+                    onChange(f.key, datePart.replace(/-/g, "/") + " " + (timePart.length === 5 ? timePart + ":00" : timePart));
+                  } else {
+                    onChange(f.key, v.replace(/-/g, "/"));
+                  }
+                }}
+              />
+            </Grid>
+          );
+        }
+        if (f.options && f.options.length > 0) {
+          return (
+            <Grid size={{ xs: 12, sm: 6 }} key={f.key}>
+              <FormControl fullWidth size="small">
+                <InputLabel>{f.label}</InputLabel>
+                <Select
+                  label={f.label}
+                  value={raw != null ? String(raw) : ""}
+                  onChange={(e) => onChange(f.key, e.target.value || null)}
+                >
+                  <MenuItem value=""><em>—</em></MenuItem>
+                  {f.options.map((opt) => (
+                    <MenuItem key={opt} value={opt}>{opt}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Grid>
+          );
+        }
         return (
-          <Grid item xs={12} sm={f.type === "text" ? 12 : 6} key={f.key}>
+          <Grid size={{ xs: 12, sm: f.type === "text" ? 12 : 6 }} key={f.key}>
             <TextField
               fullWidth size="small" label={f.label}
               type={f.type === "number" ? "number" : "text"}
@@ -365,18 +463,153 @@ interface Props {
   initial: Partial<ProjectExperiment>;
   title: string;
   saving: boolean;
-  projectId: string;
+  /** If absent, the dialog operates in main-DB mode (no project) */
+  projectId?: string;
   onClose: () => void;
-  onSubmit: (data: Partial<ProjectExperiment>) => void;
+  /** Called after save in project mode */
+  onSubmit?: (data: Partial<ProjectExperiment>) => void;
+  /** Called after save in main-DB mode */
+  onSaved?: () => void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main component
 // ─────────────────────────────────────────────────────────────────────────────
-export default function ExpDeepEditDialog({ open, initial, title, saving, projectId, onClose, onSubmit }: Props) {
+export default function ExpDeepEditDialog({ open, initial, title, saving, projectId, onClose, onSubmit, onSaved }: Props) {
   const [form, setForm] = useState<Partial<ProjectExperiment>>(initial);
   const [nodes, setNodes] = useState<Record<string, NodeState>>({});
   const [submitting, setSubmitting] = useState(false);
+
+  // Dynamic extra fields and candidates from Settings / column_defs
+  // keyed by nodeKey in NODE_DEFS
+  const [extraFieldsByNode, setExtraFieldsByNode] = useState<Record<string, Field[]>>({});
+  const [candidatesByNode, setCandidatesByNode]   = useState<Record<string, Record<string, string[]>>>({});
+  const [trajectoryTypeDefs, setTrajectoryTypeDefs] = useState<TrajectoryTypeDef[]>([]);
+  const trajectoryTypeDefsRef = useRef<TrajectoryTypeDef[]>([]);
+  useEffect(() => { trajectoryTypeDefsRef.current = trajectoryTypeDefs; }, [trajectoryTypeDefs]);
+
+  const deriveFieldType = (dt: string): FType => {
+    if (dt === "boolean") return "boolean";
+    if (dt === "float" || dt === "numeric" || dt === "integer" || dt === "int") return "number";
+    if (dt === "date") return "date";
+    if (dt === "datetime") return "datetime";
+    if (dt === "text") return "text";
+    return "string";
+  };
+
+  // Parse "label;;#color|label2" → string[]
+  const parseCandidateLabels = (raw: string): string[] => {
+    if (!raw) return [];
+    const parts = raw.includes("|") ? raw.split("|") : raw.split("/");
+    return parts.map(p => { const idx = p.indexOf(";;"); return idx >= 0 ? p.slice(0, idx).trim() : p.trim(); }).filter(Boolean);
+  };
+
+  // Load column defs for all tables and populate extraFieldsByNode + candidatesByNode
+  const loadExtraFields = useCallback(async () => {
+    // Build unique table-name → [nodeKeys] mapping (uppercase for API)
+    const tableToNodes: Record<string, string[]> = {};
+    for (const [nodeKey, def] of Object.entries(NODE_DEFS)) {
+      const t = def.table.toUpperCase();
+      (tableToNodes[t] ??= []).push(nodeKey);
+    }
+    const tables = Object.keys(tableToNodes);
+    try {
+      const results = await Promise.all(
+        tables.map(t => columnDefsTableApi(t).list().catch(() => ({ data: [] as any[] })))
+      );
+      const extraByNode: Record<string, Field[]> = {};
+      const candsByNode: Record<string, Record<string, string[]>> = {};
+      results.forEach((res, i) => {
+        const tableName = tables[i];
+        const nodeKeys = tableToNodes[tableName];
+        const rows = (res.data ?? []) as any[];
+        for (const nodeKey of nodeKeys) {
+          const def = NODE_DEFS[nodeKey];
+          const existingKeys = new Set(def.fields.map(f => f.key));
+          const candidates: Record<string, string[]> = {};
+          const extra: Field[] = [];
+          for (const row of rows) {
+            if (row.candidates) {
+              const labels = parseCandidateLabels(String(row.candidates));
+              if (labels.length) candidates[row.column_name] = labels;
+            }
+            if (!existingKeys.has(row.column_name) && row.is_id !== "pk" && row.is_id !== "fk") {
+              extra.push({
+                key: row.column_name,
+                label: row.column_name,
+                type: deriveFieldType(row.data_type ?? "string"),
+                options: row.candidates ? parseCandidateLabels(String(row.candidates)) : undefined,
+              });
+            }
+          }
+          extraByNode[nodeKey] = extra;
+          candsByNode[nodeKey] = candidates;
+        }
+      });
+      setExtraFieldsByNode(extraByNode);
+      setCandidatesByNode(candsByNode);
+
+      // Load trajectory type defs and register dynamic nodes
+      try {
+        const tdRes = await trajectoryTypeDefsApi.list();
+        const tdefs = tdRes.data;
+        setTrajectoryTypeDefs(tdefs);
+        for (const td of tdefs) {
+          const nodeKey = td.param_table; // e.g. "line_parameter", "circle_parameter"
+          if (!NODE_DEFS[nodeKey]) {
+            // Register dynamic node def
+            const slug = td.param_table.replace(/_/g, "-");
+            const tableUpper = td.param_table.toUpperCase();
+            // Load fields from column_defs for this param table
+            const fieldRes = await columnDefsTableApi(tableUpper).list().catch(() => ({ data: [] as any[] }));
+            const dynFields: Field[] = (fieldRes.data as any[])
+              .filter(c => c.is_id !== "pk" && c.is_id !== "fk")
+              .map(c => ({
+                key: c.column_name,
+                label: c.column_name + (c.unit ? ` [${c.unit}]` : ""),
+                type: deriveFieldType(c.data_type ?? "string"),
+                options: c.candidates ? parseCandidateLabels(String(c.candidates)) : undefined,
+              }));
+            if (dynFields.length === 0) dynFields.push({ key: "remarks", label: "remarks", type: "text" });
+            NODE_DEFS[nodeKey] = {
+              key: nodeKey, label: `${td.type_name} Parameter`,
+              table: td.param_table, pkField: td.pk_col,
+              fields: dynFields,
+            };
+            // Register in SUB_NODE_PARENT
+            const parentKey = td.parent === "main" ? "main_trajectory" : "sub_trajectory";
+            const fkField   = td.parent === "main" ? "main_trajectory_parameter_id" : "sub_trajectory_parameter_id";
+            SUB_NODE_PARENT[nodeKey] = { parentKey, fkField };
+            // Register in MAIN_CREATE_PATH (for main-DB record creation)
+            MAIN_CREATE_PATH[nodeKey] = `dyn-params/${slug}`;
+          }
+        }
+      } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Merge static NODE_DEF fields with candidates (for select dropdowns) + extra fields
+  const getNodeFields = useCallback((nodeKey: string): Field[] => {
+    const def = NODE_DEFS[nodeKey];
+    if (!def) return [];
+    const cands = candidatesByNode[nodeKey] ?? {};
+    const staticFields = def.fields.map(f => ({
+      ...f,
+      options: cands[f.key]?.length ? cands[f.key] : f.options,
+    }));
+    return [...staticFields, ...(extraFieldsByNode[nodeKey] ?? [])];
+  }, [extraFieldsByNode, candidatesByNode]);
+
+  // Picker dialog state: which fieldName is being picked (null = closed)
+  const [pickerField, setPickerField] = useState<string | null>(null);
+  // Callback to call when picker applies a value
+  const pickerCallbackRef = useRef<((id: string | null) => void) | null>(null);
+
+  const openPicker = (fieldName: string, onApply: (id: string | null) => void) => {
+    pickerCallbackRef.current = onApply;
+    setPickerField(fieldName);
+  };
 
   // Deep-loaded server data (keyed by nodeKey in the /deep response)
   const deepRef = useRef<Record<string, unknown>>({});
@@ -391,17 +624,47 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
     deepRef.current = {};
     setDeepData({});
     setSubmitting(false);
+    // Refresh dynamic extra fields from Settings whenever the dialog opens
+    loadExtraFields();
 
     const expId = (initial as Record<string, unknown>)["experiment_id"] as string | undefined;
-    if (!expId || !projectId) return;
+    if (!expId) return;
 
-    projectsApi.getExperimentDeep(projectId, expId).then((res) => {
-      const d = res.data as Record<string, unknown>;
-      deepRef.current = d;
-      setDeepData(d);
-    }).catch(() => {});
+    if (projectId) {
+      // Project mode: use /deep endpoint
+      projectsApi.getExperimentDeep(projectId, expId).then((res) => {
+        const d = res.data as Record<string, unknown>;
+        deepRef.current = d;
+        setDeepData(d);
+      }).catch(() => {});
+    } else {
+      // Main DB mode: use /detail endpoint and normalise structure
+      fetchExperimentDetail(expId).then((res) => {
+        const det = res.data;
+        const gsRaw = det.galvano_system as Record<string, unknown> | null;
+        const normalized: Record<string, unknown> = {
+          galvano_system: gsRaw
+            ? { ...gsRaw, optics_rows: (gsRaw["optics"] ?? []) }
+            : null,
+          welding_condition:   det.welding_condition as Record<string, unknown> | null,
+          // detail returns an array; keep all rows
+          experiment_material: Array.isArray(det.experiment_material)
+            ? det.experiment_material as Record<string, unknown>[]
+            : (det.experiment_material ? [det.experiment_material] : []) as Record<string, unknown>[],
+          shielding_condition: det.shielding_condition as Record<string, unknown> | null,
+          result:              det.result as Record<string, unknown> | null,
+          observation:         det.observation as Record<string, unknown> | null,
+          file:                det.file as Record<string, unknown> | null,
+          project:             null,
+        };
+        deepRef.current = normalized;
+        setDeepData(normalized);
+      }).catch(() => {});
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+
 
   // ── Expand a node ─────────────────────────────────────────────────────────
   const handleToggle = async (nodeKey: string) => {
@@ -465,9 +728,9 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
         case "line_parameter": return (((wc?.trajectory_set as Record<string, unknown>)?.main_trajectory as Record<string, unknown>)?.line_parameter as Record<string, unknown>) ?? null;
         case "sub_trajectory": return ((wc?.trajectory_set as Record<string, unknown>)?.sub_trajectory as Record<string, unknown>) ?? null;
         case "wobbling_parameter": return (((wc?.trajectory_set as Record<string, unknown>)?.sub_trajectory as Record<string, unknown>)?.wobbling_parameter as Record<string, unknown>) ?? null;
-        case "experiment_material": return em ?? null;
-        case "material_state": return (em?.material_state as Record<string, unknown>) ?? null;
-        case "material": return ((em?.material_state as Record<string, unknown>)?.material as Record<string, unknown>) ?? null;
+        case "experiment_material": return null; // array — handled separately
+        case "material_state": return ((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em as Record<string, unknown> | null)?.material_state as Record<string, unknown>) ?? null;
+        case "material": return (((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em as Record<string, unknown> | null)?.material_state as Record<string, unknown>)?.material as Record<string, unknown>) ?? null;
         case "shielding_condition": return deep["shielding_condition"] as Record<string, unknown> ?? null;
         case "result": return deep["result"] as Record<string, unknown> ?? null;
         case "observation": return deep["observation"] as Record<string, unknown> ?? null;
@@ -497,7 +760,10 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
     };
 
     // Array nodes
-    if (nodeKey === "optics_group") {
+    if (nodeKey === "experiment_material") {
+      const emArr = deep["experiment_material"];
+      rows = Array.isArray(emArr) ? (emArr as Record<string, unknown>[]) : [];
+    } else if (nodeKey === "optics_group") {
       const gs = deep["galvano_system"] as Record<string, unknown> | null;
       rows = (gs?.optics_rows as Record<string, unknown>[]) ?? [];
     } else if (nodeKey === "laser_beams") {
@@ -600,6 +866,231 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
     });
   };
 
+  // Nested field change (e.g. material_state or material inside an em row)
+  const handleNestedChange = (nodeKey: string, rowIdx: number, path: string[], fieldKey: string, value: unknown) => {
+    setNodes((p) => {
+      const rows = [...(p[nodeKey].rows ?? [])];
+      const rowData = { ...rows[rowIdx].data };
+      if (path.length === 1) {
+        rowData[path[0]] = { ...(rowData[path[0]] as Record<string, unknown> ?? {}), [fieldKey]: value };
+      } else if (path.length === 2) {
+        const outer = { ...(rowData[path[0]] as Record<string, unknown> ?? {}) };
+        outer[path[1]] = { ...(outer[path[1]] as Record<string, unknown> ?? {}), [fieldKey]: value };
+        rowData[path[0]] = outer;
+      }
+      rows[rowIdx] = { ...rows[rowIdx], data: rowData, dirty: true, nestedDirty: true };
+      return { ...p, [nodeKey]: { ...p[nodeKey], rows, dirty: true } };
+    });
+  };
+
+  // ── Sub-node FK change: update parent's FK field and mark parent dirty ────
+  // Extract a node's raw data from the deep preload cache (including PK)
+  const extractFromDeepRef = (nk: string): Record<string, unknown> | null | undefined => {
+    const deep = deepRef.current;
+    // Normalize: /detail endpoint uses 'optics', deep endpoint uses 'optics_rows'
+    const gsRaw = deep["galvano_system"] as Record<string, unknown> | null;
+    const gs = gsRaw ? {
+      ...gsRaw,
+      optics_rows: (gsRaw["optics_rows"] ?? gsRaw["optics"]) as Record<string, unknown>[] | undefined,
+    } : null;
+    const wc = deep["welding_condition"] as Record<string, unknown> | null;
+    const em = deep["experiment_material"] as Record<string, unknown> | null;
+    const ts = (wc?.trajectory_set as Record<string, unknown>) ?? null;
+    const mt = (ts?.main_trajectory as Record<string, unknown>) ?? null;
+    const st = (ts?.sub_trajectory as Record<string, unknown>) ?? null;
+    const opticsRows = (gs?.optics_rows as Record<string, unknown>[]) ?? [];
+    switch (nk) {
+      case "galvano_system":      return gsRaw;
+      case "ftheta":              return (gs?.ftheta as Record<string, unknown>) ?? null;
+      case "optics_group":        return opticsRows[0] ?? null;
+      case "laser_device": {
+        for (const o of opticsRows) { if (o.laser_device) return o.laser_device as Record<string, unknown>; }
+        return null;
+      }
+      case "doe": {
+        for (const o of opticsRows) { if (o.doe) return o.doe as Record<string, unknown>; }
+        return null;
+      }
+      case "welding_condition":   return wc;
+      case "trajectory_set":      return ts;
+      case "main_trajectory":     return mt;
+      case "line_parameter":      return (mt?.line_parameter as Record<string, unknown>) ?? null;
+      case "sub_trajectory":      return st;
+      case "wobbling_parameter":  return (st?.wobbling_parameter as Record<string, unknown>) ?? null;
+      case "experiment_material": return null; // array — handled separately
+      case "material_state": return ((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em)?.material_state as Record<string, unknown>) ?? null;
+      case "material": return (((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em)?.material_state as Record<string, unknown>)?.material as Record<string, unknown>) ?? null;
+      case "shielding_condition": return (deep["shielding_condition"] as Record<string, unknown>) ?? null;
+      case "result":              return (deep["result"] as Record<string, unknown>) ?? null;
+      case "observation":         return (deep["observation"] as Record<string, unknown>) ?? null;
+      case "file":                return (deep["file"] as Record<string, unknown>) ?? null;
+      case "project":             return (deep["project"] as Record<string, unknown>) ?? null;
+      default: return undefined; // unknown key → skip
+    }
+  };
+
+  // Extract a node's data (minus PK) from the deep preload cache
+  const getDataFromDeep = (nk: string): Record<string, unknown> => {
+    const def = NODE_DEFS[nk];
+    const raw = extractFromDeepRef(nk);
+    if (!raw) return {};
+    const clean = { ...raw };
+    delete clean[def.pkField];
+    return clean;
+  };
+
+  const handleSubFkChange = (nodeKey: string, newId: string | null) => {
+    const info = SUB_NODE_PARENT[nodeKey];
+    if (!info) return;
+    const { parentKey, fkField } = info;
+    setNodes((prev) => {
+      const existing = prev[parentKey];
+      const parentData =
+        existing?.data && Object.keys(existing.data).length > 0
+          ? { ...existing.data }
+          : getDataFromDeep(parentKey);
+      return {
+        ...prev,
+        [parentKey]: {
+          expanded: existing?.expanded ?? false,
+          loading: false,
+          original: existing?.original ?? {},
+          data: { ...parentData, [fkField]: newId },
+          dirty: true,
+        },
+      };
+    });
+  };
+
+  // ── Top-level FK change: reload deep data for affected branch ────────────
+  // Map nodeKey → detail endpoint template (same as DETAIL_ENDPOINT in IdPickerDialog)
+  const TOP_DETAIL_ENDPOINT: Record<string, string> = {
+    galvano_system:      "/api/masters/galvano-systems/{id}/detail",
+    welding_condition:   "/api/masters/welding-conditions/{id}/detail",
+    experiment_material: "/api/masters/experiment-materials/{id}/detail",
+    shielding_condition: "/api/masters/shielding-conditions/{id}",
+    result:              "/api/masters/results/{id}",
+    observation:         "/api/masters/observations/{id}",
+    file:                "/api/masters/files/{id}",
+    project:             "/api/masters/projects/{id}",
+  };
+
+  const handleTopFkChange = async (nodeKey: string, expFk: string, newId: string | null) => {
+    // 1. Update the experiment FK field in form
+    setForm((p) => ({ ...p, [expFk]: newId }));
+    // 2. Mark expanded nodes in this branch as loading (accordion stays open)
+    setNodes((prev) => {
+      const next = { ...prev };
+      for (const k of Object.keys(NODE_DEFS)) {
+        if (k === nodeKey || isDescendant(nodeKey, k)) {
+          const wasExpanded = prev[k]?.expanded ?? false;
+          next[k] = { expanded: wasExpanded, loading: wasExpanded, original: {}, data: {}, dirty: false };
+        }
+      }
+      return next;
+    });
+
+    // 3. If cleared, reset deepRef and clear loading flags
+    if (!newId) {
+      deepRef.current = { ...deepRef.current, [nodeKey]: null };
+      setDeepData((p) => ({ ...p, [nodeKey]: null }));
+      setNodes((prev) => {
+        const next = { ...prev };
+        for (const k of Object.keys(NODE_DEFS)) {
+          if ((k === nodeKey || isDescendant(nodeKey, k)) && next[k]?.loading) {
+            next[k] = { ...next[k], loading: false };
+          }
+        }
+        return next;
+      });
+      return;
+    }
+
+    // 4. Fetch fresh detail
+    const tpl = TOP_DETAIL_ENDPOINT[nodeKey];
+    if (!tpl) return;
+    try {
+      const res = await api.get(tpl.replace("{id}", newId));
+      let freshData = res.data as Record<string, unknown>;
+      // Normalize galvano_system: /detail uses 'optics', deep endpoint uses 'optics_rows'
+      if (nodeKey === "galvano_system" && freshData["optics"] !== undefined) {
+        freshData = { ...freshData, optics_rows: freshData["optics"] };
+      }
+      deepRef.current = { ...deepRef.current, [nodeKey]: freshData };
+      setDeepData((p) => ({ ...p, [nodeKey]: freshData }));
+
+      // 5. Populate all nodes in this branch (expanded and non-expanded)
+      //    so that opening a child accordion after an ID swap shows fresh data
+      setNodes((prev) => {
+        const next = { ...prev };
+
+        // Helper to build rows for array nodes from freshData
+        const getArrayRows = (k: string): Record<string, unknown>[] => {
+          if (k === "experiment_material") {
+            const emArr = freshData["experiment_material"];
+            return Array.isArray(emArr) ? (emArr as Record<string, unknown>[]) : [];
+          }
+          if (k === "optics_group") {
+            const arr = (freshData["optics_rows"] ?? freshData["optics"]) as Record<string, unknown>[] | undefined;
+            return arr ?? [];
+          }
+          if (k === "laser_beams") {
+            const opticsArr = (freshData["optics_rows"] ?? freshData["optics"]) as Record<string, unknown>[] | undefined;
+            for (const o of (opticsArr ?? [])) {
+              const ld = o["laser_device"] as Record<string, unknown> | null;
+              if (ld?.laser_beams) return ld.laser_beams as Record<string, unknown>[];
+            }
+          }
+          return [];
+        };
+
+        for (const k of Object.keys(NODE_DEFS)) {
+          if (!(k === nodeKey || isDescendant(nodeKey, k))) continue;
+          const node = next[k] ?? { expanded: false, loading: false, original: {}, data: {}, dirty: false };
+          const def = NODE_DEFS[k];
+          if (def.isArray) {
+            const rows = getArrayRows(k);
+            const makeEditable = (r: Record<string, unknown>) => { const c = { ...r }; delete c[def.pkField]; return c; };
+            next[k] = {
+              ...node, loading: false,
+              rows: rows.map((r) => ({ original: r, data: makeEditable(r), dirty: false })),
+            };
+            continue;
+          }
+          const raw = extractFromDeepRef(k);
+          if (raw !== undefined) {
+            const clean = { ...(raw ?? {}) };
+            if (def.pkField) delete clean[def.pkField];
+            next[k] = { ...node, loading: false, original: raw ?? {}, data: clean };
+          } else {
+            next[k] = { ...node, loading: false };
+          }
+        }
+        return next;
+      });
+    } catch {
+      setNodes((prev) => {
+        const next = { ...prev };
+        for (const k of Object.keys(NODE_DEFS)) {
+          if ((k === nodeKey || isDescendant(nodeKey, k)) && next[k]?.loading) {
+            next[k] = { ...next[k], loading: false };
+          }
+        }
+        return next;
+      });
+    }
+  };
+
+  // Returns true if `childKey` is a descendant of `parentKey` in the node tree
+  function isDescendant(parentKey: string, childKey: string): boolean {
+    const def = NODE_DEFS[parentKey];
+    if (!def?.children) return false;
+    for (const ck of def.children) {
+      if (ck === childKey || isDescendant(ck, childKey)) return true;
+    }
+    return false;
+  }
+
   // ── Save: bottom-up commit ────────────────────────────────────────────────
   const handleSave = async () => {
     setSubmitting(true);
@@ -608,7 +1099,13 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
       const deep = deepRef.current;
 
       const createRecord = async (table: string, data: Record<string, unknown>) => {
-        const res = await api.post(`/api/projects/${projectId}/records/${table}`, data);
+        if (projectId) {
+          const res = await api.post(`/api/projects/${projectId}/records/${table}`, data);
+          return res.data as Record<string, unknown>;
+        }
+        const path = MAIN_CREATE_PATH[table];
+        if (!path) throw new Error(`No API path for table: ${table}`);
+        const res = await api.post(`/api/masters/${path}`, data);
         return res.data as Record<string, unknown>;
       };
 
@@ -637,8 +1134,8 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
           case "sub_trajectory":       raw = st; break;
           case "wobbling_parameter":   raw = (st?.wobbling_parameter as Record<string, unknown>) ?? null; break;
           case "experiment_material":  raw = em; break;
-          case "material_state":       raw = (em?.material_state as Record<string, unknown>) ?? null; break;
-          case "material":             raw = ((em?.material_state as Record<string, unknown>)?.material as Record<string, unknown>) ?? null; break;
+          case "material_state":       raw = ((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em)?.material_state as Record<string, unknown>) ?? null; break;
+          case "material":             raw = (((Array.isArray(em) ? (em as Record<string, unknown>[])[0] : em)?.material_state as Record<string, unknown>)?.material as Record<string, unknown>) ?? null; break;
           case "shielding_condition":  raw = (deep["shielding_condition"] as Record<string, unknown>) ?? null; break;
           case "result":               raw = (deep["result"] as Record<string, unknown>) ?? null; break;
           case "observation":          raw = (deep["observation"] as Record<string, unknown>) ?? null; break;
@@ -739,20 +1236,51 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
 
       // ── material branch ─────────────────────────────────────────────────
       if (isDirty("experiment_material", "material_state", "material")) {
-        const emData = getNodeData("experiment_material");
+        const newEmId = crypto.randomUUID();
+        const emNode = nodes["experiment_material"];
+        const emRowStates = emNode?.rows ?? (
+          (Array.isArray(deep["experiment_material"])
+            ? (deep["experiment_material"] as Record<string, unknown>[])
+            : deep["experiment_material"] ? [deep["experiment_material"] as Record<string, unknown>] : [])
+          .map(r => ({ original: r, data: r, dirty: false, nestedDirty: false }))
+        );
 
-        if (isDirty("material_state", "material")) {
-          const msData = getNodeData("material_state");
-          if (isDirty("material")) {
-            const r = await createRecord("material", getNodeData("material"));
-            msData["material_id"] = r["material_id"];
+        for (const row of emRowStates) {
+          const rowData: Record<string, unknown> = { ...row.data, experiment_material_id: newEmId };
+          delete rowData["material_state"]; // nested object — not a DB column
+
+          if (row.nestedDirty) {
+            // material_state fields were explicitly edited per-row via handleNestedChange
+            const msDataNested = row.data["material_state"] as Record<string, unknown> | null;
+            if (msDataNested) {
+              const msData = { ...msDataNested };
+              delete msData["material_state_id"];
+              const matDataNested = msData["material"] as Record<string, unknown> | null;
+              delete msData["material"];
+              if (matDataNested) {
+                const matData = { ...matDataNested };
+                delete matData["material_id"];
+                const matRes = await createRecord("material", matData);
+                msData["material_id"] = matRes["material_id"];
+              }
+              const msRes = await createRecord("material_state", msData);
+              rowData["material_state_id"] = msRes["material_state_id"];
+            }
+          } else if (isDirty("material_state", "material")) {
+            // Global material_state node was explicitly modified (fallback)
+            const msData = getNodeData("material_state");
+            if (isDirty("material")) {
+              const r = await createRecord("material", getNodeData("material"));
+              msData["material_id"] = r["material_id"];
+            }
+            const r = await createRecord("material_state", msData);
+            rowData["material_state_id"] = r["material_state_id"];
           }
-          const r = await createRecord("material_state", msData);
-          emData["material_state_id"] = r["material_state_id"];
-        }
+          // else: no material_state changes → keep existing material_state_id from rowData
 
-        const emRes = await createRecord("experiment_material", emData);
-        expPayload["experiment_material_id"] = emRes["experiment_material_id"];
+          await createRecord("experiment_material", rowData);
+        }
+        expPayload["experiment_material_id"] = newEmId;
       }
 
       // ── leaf branches ───────────────────────────────────────────────────
@@ -769,18 +1297,28 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
         }
       }
 
-      // project: always stamp current project_id; update project_name if dirty
-      expPayload["project_id"] = projectId;
-      if (isDirty("project")) {
-        const projData = getNodeData("project");
-        // Create/upsert project record in project DB
-        await api.post(`/api/projects/${projectId}/records/project`, {
-          project_id: projectId,
-          ...projData,
-        }).catch(() => {/* ignore if already exists */});
+      if (projectId) {
+        // Project mode: stamp project_id; optionally update project record
+        expPayload["project_id"] = projectId;
+        if (isDirty("project")) {
+          const projData = getNodeData("project");
+          await api.post(`/api/projects/${projectId}/records/project`, {
+            project_id: projectId,
+            ...projData,
+          }).catch(() => {/* ignore if already exists */});
+        }
+        onSubmit?.(expPayload as Partial<ProjectExperiment>);
+      } else {
+        // Main DB mode: create/update the experiment directly
+        const expId = (initial as Record<string, unknown>)["experiment_id"] as string | undefined;
+        if (expId) {
+          await updateExperiment(expId, expPayload as Partial<Experiment>);
+        } else {
+          await createExperiment(expPayload as Partial<Experiment>);
+        }
+        onSaved?.();
+        onClose();
       }
-
-      onSubmit(expPayload as Partial<ProjectExperiment>);
     } finally {
       setSubmitting(false);
     }
@@ -795,7 +1333,8 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
     // Otherwise read from deepData (reactive state)
     const gs = deepData["galvano_system"] as Record<string, unknown> | null;
     const wc = deepData["welding_condition"] as Record<string, unknown> | null;
-    const em = deepData["experiment_material"] as Record<string, unknown> | null;
+    const em = deepData["experiment_material"];
+    const emFirst = Array.isArray(em) ? (em as Record<string, unknown>[])[0] ?? null : em as Record<string, unknown> | null;
     const ts = (wc?.trajectory_set as Record<string, unknown>) ?? null;
     const mt = (ts?.main_trajectory as Record<string, unknown>) ?? null;
     const st = (ts?.sub_trajectory as Record<string, unknown>) ?? null;
@@ -825,11 +1364,30 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
       case "line_parameter": return ((mt?.line_parameter as Record<string, unknown>)?.[def.pkField] as string) ?? null;
       case "sub_trajectory": return (st?.[def.pkField] as string) ?? null;
       case "wobbling_parameter": return ((st?.wobbling_parameter as Record<string, unknown>)?.[def.pkField] as string) ?? null;
-      case "material_state": return ((em?.material_state as Record<string, unknown>)?.[def.pkField] as string) ?? null;
-      case "material": return (((em?.material_state as Record<string, unknown>)?.material as Record<string, unknown>)?.[def.pkField] as string) ?? null;
+      case "material_state": return ((emFirst?.material_state as Record<string, unknown>)?.[def.pkField] as string) ?? null;
+      case "material": return (((emFirst?.material_state as Record<string, unknown>)?.material as Record<string, unknown>)?.[def.pkField] as string) ?? null;
       case "project": return (deepData["project"] as Record<string, unknown> | null)?.project_id as string ?? null;
       default: return null;
     }
+  };
+
+  // ── Resolve which parameter child to use based on trajectory type value ────
+  const getEffectiveChildren = (nodeKey: string, nodeData: Record<string, unknown> | undefined): string[] | undefined => {
+    const def = NODE_DEFS[nodeKey];
+    if (!def?.children) return undefined;
+    if (nodeKey === "main_trajectory") {
+      const typeName = (nodeData?.["main_trajectory_type"] ?? "") as string;
+      const td = trajectoryTypeDefsRef.current.find(d => d.parent === "main" && d.type_name === typeName);
+      if (td && NODE_DEFS[td.param_table]) return [td.param_table];
+      return ["line_parameter"]; // fallback
+    }
+    if (nodeKey === "sub_trajectory") {
+      const typeName = (nodeData?.["sub_trajectory_type"] ?? "") as string;
+      const td = trajectoryTypeDefsRef.current.find(d => d.parent === "sub" && d.type_name === typeName);
+      if (td && NODE_DEFS[td.param_table]) return [td.param_table];
+      return ["wobbling_parameter"]; // fallback
+    }
+    return def.children;
   };
 
   // ── Render one node accordion ─────────────────────────────────────────────
@@ -889,7 +1447,7 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
                     Row {idx + 1} {row.dirty ? " — modified" : ""}
                   </Typography>
                   <FieldGrid
-                    fields={def.fields}
+                    fields={getNodeFields(nodeKey)}
                     data={row.data}
                     onChange={(k, v) => handleArrayChange(nodeKey, idx, k, v)}
                   />
@@ -902,15 +1460,35 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
             )
           ) : (
             <>
+              {/* Sub-node ID change (for non-top-level nodes that have a parent FK) */}
+              {SUB_NODE_PARENT[nodeKey] && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1.5 }}>
+                  <Typography variant="caption" color="text.secondary" sx={{ minWidth: 80 }}>
+                    Change ID:
+                  </Typography>
+                  <Typography variant="caption" sx={{ fontFamily: "monospace", flex: 1, color: currentId ? "text.primary" : "text.disabled" }}>
+                    {currentId ?? "— (not set)"}
+                  </Typography>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<EditIcon fontSize="small" />}
+                    onClick={() => openPicker(def.pkField, (v) => handleSubFkChange(nodeKey, v))}
+                    sx={{ flexShrink: 0 }}
+                  >
+                    Select ID
+                  </Button>
+                </Box>
+              )}
               <FieldGrid
-                fields={def.fields}
+                fields={getNodeFields(nodeKey)}
                 data={node?.data ?? {}}
                 onChange={(k, v) => handleChange(nodeKey, k, v)}
               />
               {/* Children */}
-              {def.children && isExpanded && (
+              {getEffectiveChildren(nodeKey, node?.data) && isExpanded && (
                 <Box sx={{ mt: 1.5 }}>
-                  {def.children
+                  {(getEffectiveChildren(nodeKey, node?.data) ?? [])
                     .filter((ck) => nodeKey !== "optics_group") // optics_group children rendered per-row
                     .map((ck) => renderNode(ck, 1))}
                 </Box>
@@ -937,7 +1515,7 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
         />
 
         {/* Top-level FK branches */}
-        {TOP_BRANCHES.map(({ nodeKey, expFk }) => {
+        {TOP_BRANCHES.filter(({ nodeKey }) => projectId || nodeKey !== "project").map(({ nodeKey, expFk }) => {
           const fkVal = form[expFk] as string | null;
           const node = nodes[nodeKey];
           const isExpanded = node?.expanded ?? false;
@@ -985,16 +1563,85 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
                   </Box>
                 ) : (
                   <>
-                    <FieldGrid
-                      fields={def.fields}
-                      data={node?.data ?? {}}
-                      onChange={(k, v) => handleChange(nodeKey, k, v)}
-                    />
-                    {/* Nested children */}
-                    {def.children && isExpanded && (
-                      <Box sx={{ mt: 1.5 }}>
-                        {def.children.map((ck) => renderNode(ck, 0))}
-                      </Box>
+                    {/* ── Change ID ── */}
+                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary" sx={{ minWidth: 80 }}>
+                        Change ID:
+                      </Typography>
+                      <Typography variant="caption" sx={{ fontFamily: "monospace", flex: 1, color: fkVal ? "text.primary" : "text.disabled" }}>
+                        {fkVal ?? "— (not set)"}
+                      </Typography>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        startIcon={<EditIcon fontSize="small" />}
+                        onClick={() => openPicker(expFk as string, (v) => handleTopFkChange(nodeKey, expFk as string, v))}
+                        sx={{ flexShrink: 0 }}
+                      >
+                        Select ID
+                      </Button>
+                    </Box>
+                    <Divider sx={{ mb: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary">or edit fields (new record created on save)</Typography>
+                    </Divider>
+                    {def.isArray ? (
+                      // Array node (experiment_material)
+                      (node?.rows ?? []).length === 0 ? (
+                        <Typography variant="caption" color="text.secondary">No rows.</Typography>
+                      ) : (
+                        (node?.rows ?? []).map((row, idx) => {
+                          const msData = row.data["material_state"] as Record<string, unknown> | null;
+                          const matData = msData ? (msData["material"] as Record<string, unknown> | null) : null;
+                          return (
+                            <Box key={idx} sx={{ mb: 1.5, p: 1.5, border: "1px dashed", borderColor: "divider", borderRadius: 1 }}>
+                              <Typography variant="caption" color="text.secondary" sx={{ mb: 1, display: "block" }}>
+                                Row {idx + 1}{row.dirty ? " — modified" : ""}
+                              </Typography>
+                              <FieldGrid
+                                fields={getNodeFields(nodeKey).filter(f => f.key !== "material_state_id")}
+                                data={row.data}
+                                onChange={(k, v) => handleArrayChange(nodeKey, idx, k, v)}
+                              />
+                              {msData && (
+                                <Box sx={{ mt: 1, ml: 1, pl: 1.5, borderLeft: "2px solid", borderColor: "divider" }}>
+                                  <Typography variant="caption" color="text.secondary" fontWeight={600} sx={{ display: "block", mb: 0.5 }}>Material State</Typography>
+                                  <FieldGrid
+                                    fields={getNodeFields("material_state")}
+                                    data={msData}
+                                    onChange={(k, v) => handleNestedChange("experiment_material", idx, ["material_state"], k, v)}
+                                  />
+                                  {matData && (
+                                    <Box sx={{ mt: 1, ml: 1, pl: 1.5, borderLeft: "2px solid", borderColor: "divider" }}>
+                                      <Typography variant="caption" color="text.secondary" fontWeight={600} sx={{ display: "block", mb: 0.5 }}>Material</Typography>
+                                      <FieldGrid
+                                        fields={getNodeFields("material")}
+                                        data={matData}
+                                        onChange={(k, v) => handleNestedChange("experiment_material", idx, ["material_state", "material"], k, v)}
+                                      />
+                                    </Box>
+                                  )}
+                                </Box>
+                              )}
+                            </Box>
+                          );
+                        })
+                      )
+                    ) : (
+                      <>
+                        <FieldGrid
+                          fields={getNodeFields(nodeKey)}
+                          data={node?.data ?? {}}
+                          onChange={(k, v) => handleChange(nodeKey, k, v)}
+                        />
+                        {/* Nested children */}
+                        {getEffectiveChildren(nodeKey, node?.data) && isExpanded && (
+                          <Box sx={{ mt: 1.5 }}>
+                            {(getEffectiveChildren(nodeKey, node?.data) ?? [])
+                              .filter((ck) => !NODE_DEFS[nodeKey]?.isArray)
+                              .map((ck) => renderNode(ck, 0))}
+                          </Box>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -1010,6 +1657,20 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
           {isBusy ? <CircularProgress size={18} /> : "Save"}
         </Button>
       </DialogActions>
+
+      {/* ── ID picker (shared across all nodes) ── */}
+      {pickerField && (
+        <IdPickerDialog
+          open={!!pickerField}
+          fieldName={pickerField}
+          currentValue={null}
+          onClose={() => setPickerField(null)}
+          onApply={(id) => {
+            if (pickerCallbackRef.current) pickerCallbackRef.current(id);
+            setPickerField(null);
+          }}
+        />
+      )}
     </Dialog>
   );
 }

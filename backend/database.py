@@ -75,7 +75,7 @@ def init_db():
 
 
 _CUSTOM_COL_TYPE_MAP = {
-    "string": "TEXT", "text": "TEXT", "uuid": "TEXT",
+    "string": "TEXT", "text": "TEXT", "uuid": "TEXT", "path": "TEXT",
     "float": "REAL", "integer": "INTEGER", "boolean": "INTEGER",
     "date": "TEXT", "datetime": "TEXT",
 }
@@ -108,3 +108,8 @@ def _migrate():
             cols.add("project_id")
         # Auto-add custom columns defined in column_defs for EXPERIMENT table
         _migrate_experiment_custom_cols(conn, cols)
+        # Add remarks to project table if missing
+        proj_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(project)"))}
+        if "remarks" not in proj_cols:
+            conn.execute(text("ALTER TABLE project ADD COLUMN remarks TEXT"))
+            conn.commit()

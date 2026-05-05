@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, Fragment } from "react";
+import { useState, useEffect, useCallback, Fragment, useMemo, useRef } from "react";
 import {
   Box, Button, Chip, CircularProgress, Dialog, DialogActions,
   DialogContent, DialogTitle, Divider, FormControl, IconButton, InputAdornment,
@@ -6,12 +6,17 @@ import {
   TableContainer, TableHead, TableRow, TextField, Tooltip, Typography,
 } from "@mui/material";
 import { columnDefsTableApi } from "../../api/masters";
+import { IdPickerDialog } from "../common/IdPickerDialog";
+import { FK_CONFIG } from "../common/IdSelectField";
 import { useUndo } from "../../context/UndoContext";
 import AddIcon from "@mui/icons-material/Add";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CloseIcon from "@mui/icons-material/Close";
+import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import FormatColorResetIcon from "@mui/icons-material/FormatColorReset";
 
 // ── Shared tree types ─────────────────────────────────────────────────────────
 export type TItem = { label: React.ReactNode; value?: React.ReactNode; children?: TItem[] };
@@ -168,24 +173,41 @@ interface Props {
   api: CrudApi;
   /** If provided, clicking a row opens a right-side panel with this tree */
   buildTree?: (item: any) => TItem[] | Promise<TItem[]>;
+  /** If provided, ↑/↓ reorder buttons appear in the Actions column.
+   *  Called with the new ordered array of items after a move. */
+  onReorder?: (newItems: any[]) => Promise<void>;
+  /** Extra table names whose column_def candidates should be merged into candidatesMap.
+   *  Use when the tree expansion shows nested entities from other tables. */
+  candidatesTables?: string[];
 }
 
 // ── Side panel ────────────────────────────────────────────────────────────────
 function SidePanel({
-  title, item, treeNodes, loading, onClose, candidatesMap,
-}: { title: string; item: any; treeNodes: TItem[] | null; loading: boolean; onClose: () => void; candidatesMap: Record<string, Candidate[]> }) {
+  title, item, treeNodes, loading, onClose, onEdit, onDelete, candidatesMap,
+}: { title: string; item: any; treeNodes: TItem[] | null; loading: boolean; onClose: () => void; onEdit?: () => void; onDelete?: () => void; candidatesMap: Record<string, Candidate[]> }) {
   return (
     <Paper
       elevation={3}
       sx={{
-        position: "sticky", top: 8,
         maxHeight: "calc(100vh - 220px)", overflow: "auto",
         p: 1.5, minWidth: 260, flex: "0 0 38%",
       }}
     >
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
         <Typography variant="caption" fontWeight="bold" color="primary">{title}</Typography>
-        <IconButton size="small" onClick={onClose}><CloseIcon sx={{ fontSize: 14 }} /></IconButton>
+        <Box sx={{ display: "flex", gap: 0.5 }}>
+          {onEdit && (
+            <Tooltip title="Edit">
+              <IconButton size="small" onClick={onEdit}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+            </Tooltip>
+          )}
+          {onDelete && (
+            <Tooltip title="Delete">
+              <IconButton size="small" color="error" onClick={onDelete}><DeleteIcon sx={{ fontSize: 14 }} /></IconButton>
+            </Tooltip>
+          )}
+          <IconButton size="small" onClick={onClose}><CloseIcon sx={{ fontSize: 14 }} /></IconButton>
+        </Box>
       </Box>
       <Divider sx={{ mb: 1 }} />
       {loading
@@ -204,7 +226,7 @@ function SidePanel({
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
-export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
+export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, candidatesTables }: Props) {
   const [items, setItems]             = useState<any[]>([]);
   const [loading, setLoading]         = useState(false);
   const [open, setOpen]               = useState(false);
@@ -218,23 +240,58 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
   const [tagColors, setTagColors]     = useState<Record<string, string>>({});
   // candidates from column_defs: { columnName → Candidate[] }
   const [candidatesMap, setCandidatesMap] = useState<Record<string, Candidate[]>>({});
+  const [orderMap, setOrderMap]           = useState<Record<string, number>>({});
+  const [fkPickerField, setFkPickerField] = useState<string | null>(null);
+  // Extra fields discovered from column_def (not in the static fields prop)
+  const [extraFields, setExtraFields]     = useState<FieldDef[]>([]);
   const { registerUndo } = useUndo();
 
-  useEffect(() => {
-    if (!title) return;
-    columnDefsTableApi(title).list().then(r => {
-      const map: Record<string, Candidate[]> = {};
-      for (const row of (r.data as any[])) {
-        if (row.candidates) {
-          const parts = parseCandidates(row.candidates);
-          if (parts.length) map[row.column_name] = parts;
-        }
-      }
-      setCandidatesMap(map);
-    }).catch(() => {});
-  }, [title]);
+  // Derive a FieldDef type from column_def data_type
+  const deriveFieldType = (dataType: string, colName: string): FieldDef['type'] => {
+    const dt = (dataType ?? '').toLowerCase();
+    if (dt === 'boolean') return 'boolean';
+    if (dt === 'float' || dt === 'numeric') return 'number';
+    if (dt === 'integer' || dt === 'int') {
+      if (colName.endsWith('_flag') || colName.includes('flag')) return 'boolean';
+      return 'number';
+    }
+    return 'text';
+  };
 
-  const showPanel = !!buildTree && selectedId !== null;
+  const loadColDefs = useCallback(async () => {
+    if (!title) return;
+    const allTables = Array.from(new Set([title, ...(candidatesTables ?? [])]));
+    try {
+      const results = await Promise.all(allTables.map(t => columnDefsTableApi(t).list()));
+      const map: Record<string, Candidate[]> = {};
+      const oMap: Record<string, number> = {};
+      results.forEach((r, idx) => {
+        for (const row of (r.data as any[])) {
+          if (idx === 0 && row.order_index != null) {
+            oMap[row.column_name] = Number(row.order_index);
+          }
+          if (row.candidates) {
+            const parts = parseCandidates(row.candidates);
+            if (parts.length) map[row.column_name] = parts;
+          }
+        }
+      });
+      setCandidatesMap(map);
+      setOrderMap(oMap);
+
+      const existingKeys = new Set(fields.map(f => f.key));
+      const primaryRows = (results[0]?.data ?? []) as any[];
+      const extra: FieldDef[] = primaryRows
+        .filter(row => !existingKeys.has(row.column_name) && row.is_id !== 'pk')
+        .map(row => ({
+          key: row.column_name,
+          label: row.column_name,
+          type: deriveFieldType(row.data_type ?? 'string', row.column_name),
+        }));
+      setExtraFields(extra);
+    } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [title, candidatesTables]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -247,6 +304,8 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
   }, [api]);
 
   useEffect(() => { load(); }, [load]);
+  // Initial colDefs load (also runs on candidatesTables change)
+  useEffect(() => { loadColDefs(); }, [loadColDefs]);
 
   // Lazily load FK option lists when the dialog opens
   useEffect(() => {
@@ -272,8 +331,22 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
     setTreeNodes(null);
     setTreeLoading(true);
     try {
-      const nodes = await buildTree(item);
-      setTreeNodes(nodes);
+      const staticNodes = await buildTree(item);
+      // Collect labels already shown in the static tree
+      const shownLabels = new Set(staticNodes.map(n => typeof n.label === "string" ? n.label : ""));
+      const extraFieldKeys = new Set(extraFields.map(ef => ef.key));
+      const allNodes: TItem[] = [...staticNodes];
+      // Append any item properties not yet shown:
+      //   - Skip internal keys ("_" prefix)
+      //   - Skip FK/PK *_id columns UNLESS explicitly added via Settings
+      //   - Show null values as null (renders as blank label in tree, same as static fields)
+      for (const [key, val] of Object.entries(item)) {
+        if (shownLabels.has(key)) continue;
+        if (key.startsWith("_")) continue;
+        if (key.endsWith("_id") && !extraFieldKeys.has(key)) continue;
+        allNodes.push({ label: key, value: val != null ? String(val) : null });
+      }
+      setTreeNodes(allNodes);
     } finally {
       setTreeLoading(false);
     }
@@ -310,6 +383,18 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
     load();
   };
 
+  const handleMoveRow = async (idx: number, dir: -1 | 1) => {
+    const newItems = [...items];
+    const swapIdx = idx + dir;
+    if (swapIdx < 0 || swapIdx >= newItems.length) return;
+    [newItems[idx], newItems[swapIdx]] = [newItems[swapIdx], newItems[idx]];
+    setItems(newItems);  // optimistic update
+    if (onReorder) {
+      await onReorder(newItems);
+      load();  // reload from DB to confirm the new order was saved
+    }
+  };
+
   const handleClone = async (item: any) => {
     const { [pkField]: _pk, ...rest } = item;
     const res = await api.create(rest);
@@ -328,6 +413,28 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
 
   const selectedItem = items.find(i => i[pkField] === selectedId);
 
+  const showPanel = !!buildTree && selectedId !== null;
+
+  // Dynamic panel top: align with TableContainer top
+  const tableContainerRef = useRef<HTMLDivElement>(null);
+  const [panelTop, setPanelTop] = useState(200);
+  useEffect(() => {
+    const measure = () => {
+      if (tableContainerRef.current) {
+        setPanelTop(Math.round(tableContainerRef.current.getBoundingClientRect().top));
+      }
+    };
+    const raf = requestAnimationFrame(measure);
+    window.addEventListener("resize", measure);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", measure); };
+  }, [loading, items.length]);
+
+  // Sort all fields (static + dynamic) by column_def order_index
+  const orderedFields = useMemo(() => {
+    const all = [...fields, ...extraFields];
+    return [...all].sort((a, b) => (orderMap[a.key] ?? 9999) - (orderMap[b.key] ?? 9999));
+  }, [fields, extraFields, orderMap]);
+
   return (
     <Box>
       {/* ── Header ── */}
@@ -338,15 +445,15 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
 
       {/* ── Table + side panel ── */}
       {loading ? <CircularProgress size={20} /> : (
-        <Box sx={{ display: "flex", gap: 1.5, alignItems: "flex-start" }}>
+        <Box sx={{ paddingRight: showPanel ? "41%" : 0, transition: "padding-right 0.15s ease" }}>
           {/* table */}
-          <Box sx={{ flex: showPanel ? "0 0 58%" : "1 1 100%", minWidth: 0, overflow: "auto" }}>
-            <TableContainer component={Paper} sx={{ maxHeight: 400, overflowX: "auto" }}>
-              <Table size="small" stickyHeader sx={{ tableLayout: "auto" }}>
+          <Box>
+            <TableContainer component={Paper} sx={{ maxHeight: 400, overflowX: "auto" }} ref={tableContainerRef}>
+              <Table size="small" stickyHeader sx={{ tableLayout: "auto", "& tbody td": { paddingTop: "0 !important", paddingBottom: "0 !important", lineHeight: "1.4" } }}>
                 <TableHead>
                   <TableRow>
                     {pkField !== "_id" && <TableCell align="center" sx={{ fontWeight: "bold", whiteSpace: "nowrap" }}>{pkField}</TableCell>}
-                    {fields.filter(f => !f.hideInTable).map(f => (
+                    {orderedFields.filter(f => !f.hideInTable).map(f => (
                       <TableCell key={f.key} align="center" sx={{ fontWeight: "bold", whiteSpace: "nowrap" }}>{f.label}</TableCell>
                     ))}
                     <TableCell align="center" sx={{ fontWeight: "bold", whiteSpace: "nowrap" }}>Actions</TableCell>
@@ -361,14 +468,14 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
                         key={id}
                         hover
                         selected={isSel}
-                        onClick={buildTree ? () => handleRowClick(item) : undefined}
-                        sx={{ cursor: buildTree ? "pointer" : undefined }}
+                        onClick={buildTree ? (e) => handleRowClick(item) : undefined}
+                        sx={{ cursor: buildTree ? "pointer" : undefined, "& td": { paddingTop: "0 !important", paddingBottom: "0 !important" } }}
                       >
-                        {pkField !== "_id" && <TableCell align="center" sx={{ fontFamily: "monospace", fontSize: 10, whiteSpace: "nowrap" }}>
+                        {pkField !== "_id" && <TableCell align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontFamily: "monospace", fontSize: 10, whiteSpace: "nowrap" }}>
                           <Tooltip title={String(id)}><span>{String(id).slice(0, 8) + "…"}</span></Tooltip>
                         </TableCell>}
-                        {fields.filter(f => !f.hideInTable).map(f => (
-                          <TableCell key={f.key} align="center" sx={{ fontSize: 12, whiteSpace: "nowrap" }}>
+                        {orderedFields.filter(f => !f.hideInTable).map(f => (
+                          <TableCell key={f.key} align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontSize: 12, whiteSpace: "nowrap" }}>
                             {f.renderCell
                               ? f.renderCell(item[f.key])
                               : f.type === "tags"
@@ -405,7 +512,25 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
                                     })()}
                           </TableCell>
                         ))}
-                        <TableCell align="center" onClick={e => e.stopPropagation()}>
+                        <TableCell align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ whiteSpace: "nowrap" }} onClick={e => e.stopPropagation()}>
+                          {onReorder && (
+                            <>
+                              <Tooltip title="Move up">
+                                <span>
+                                  <IconButton size="small" onClick={() => handleMoveRow(items.indexOf(item), -1)} disabled={items.indexOf(item) === 0}>
+                                    <ArrowUpwardIcon sx={{ fontSize: 14 }} />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                              <Tooltip title="Move down">
+                                <span>
+                                  <IconButton size="small" onClick={() => handleMoveRow(items.indexOf(item), 1)} disabled={items.indexOf(item) === items.length - 1}>
+                                    <ArrowDownwardIcon sx={{ fontSize: 14 }} />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                            </>
+                          )}
                           <Tooltip title="Copy">
                             <IconButton size="small" onClick={() => handleClone(item)}>
                               <ContentCopyIcon sx={{ fontSize: 14 }} />
@@ -437,14 +562,27 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
 
           {/* right side panel */}
           {showPanel && selectedItem && (
-            <SidePanel
-              title={title}
-              item={selectedItem}
-              treeNodes={treeNodes}
-              loading={treeLoading}
-              onClose={() => { setSelectedId(null); setTreeNodes(null); }}
-              candidatesMap={candidatesMap}
-            />
+            <Box sx={{
+              position: "fixed",
+              top: `${panelTop}px`,
+              right: 0,
+              bottom: 0,
+              width: "40%",
+              overflow: "auto",
+              zIndex: 100,
+              boxShadow: 6,
+            }}>
+              <SidePanel
+                title={title}
+                item={selectedItem}
+                treeNodes={treeNodes}
+                loading={treeLoading}
+                onClose={() => { setSelectedId(null); setTreeNodes(null); }}
+                onEdit={() => openEdit(selectedItem)}
+                onDelete={() => { handleDelete(selectedItem[pkField]); }}
+                candidatesMap={candidatesMap}
+              />
+            </Box>
           )}
         </Box>
       )}
@@ -454,7 +592,7 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
         <DialogTitle>{editing ? "Edit" : "Add"} — {title}</DialogTitle>
         <DialogContent>
           <Box sx={{ display: "flex", flexDirection: "column", gap: 2, pt: 1 }}>
-            {fields.map(f => {
+            {orderedFields.map(f => {
               const isDisabled   = f.disabledWhen?.(form) ?? false;
               const defaultValue = f.defaultWhen?.(form);
 
@@ -489,6 +627,17 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
                               sx={{ width: 28, height: 22, border: "none", cursor: "pointer", p: 0, borderRadius: 0.5 }}
                             />
                           </Tooltip>
+                          {cand.color && (
+                            <Tooltip title="Clear color">
+                              <IconButton size="small" sx={{ p: 0.2, opacity: 0.5, '&:hover': { opacity: 1 } }}
+                                onClick={() => {
+                                  const next = currentCands.map((c, j) => j === i ? { label: c.label } : c);
+                                  setForm(prev => ({ ...prev, [f.key]: serializeCandidates(next) || null }));
+                                }}>
+                                <FormatColorResetIcon sx={{ fontSize: 14 }} />
+                              </IconButton>
+                            </Tooltip>
+                          )}
                           <Chip
                             label={cand.label} size="small"
                             sx={{ bgcolor: cand.color ?? undefined, color: cand.color ? "#fff" : undefined, fontWeight: 600, height: 20, fontSize: 11 }}
@@ -560,8 +709,50 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
               }
 
               if (f.type === "fk") {
-                const opts       = fkOptions[f.key] ?? [];
                 const currentVal: string = form[f.key] ?? "";
+
+                // Fields with FK_CONFIG: open IdPickerDialog for rich list + nested detail preview
+                if (FK_CONFIG[f.key]) {
+                  const opts = fkOptions[f.key] ?? [];
+                  const opt  = opts.find(o => o[f.fkPk!] === currentVal);
+                  const humanLabel = opt && f.fkLabel ? f.fkLabel(opt) : null;
+                  return (
+                    <Box key={f.key}>
+                      <Typography variant="caption" color="text.secondary"
+                        sx={{ display: "block", mb: 0.5, fontWeight: 600 }}>
+                        {f.label}
+                      </Typography>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 1, p: 1,
+                        border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                        <Typography variant="caption" sx={{
+                          fontFamily: "monospace", flex: 1,
+                          color: currentVal ? "text.primary" : "text.disabled" }}>
+                          {currentVal ? currentVal.slice(0, 18) + "…" : "— (not set)"}
+                        </Typography>
+                        {currentVal && (
+                          <IconButton size="small"
+                            onClick={() => setForm(p => ({ ...p, [f.key]: null }))}>
+                            <CloseIcon sx={{ fontSize: 14 }} />
+                          </IconButton>
+                        )}
+                        <Button size="small" variant="outlined"
+                          startIcon={<EditIcon fontSize="small" />}
+                          onClick={() => setFkPickerField(f.key)}>
+                          Select
+                        </Button>
+                      </Box>
+                      {humanLabel && (
+                        <Typography variant="caption" color="text.secondary"
+                          sx={{ mt: 0.3, display: "block", fontSize: 10 }}>
+                          {humanLabel}
+                        </Typography>
+                      )}
+                    </Box>
+                  );
+                }
+
+                // Fallback: Select dropdown for FK fields not in FK_CONFIG (e.g. composite-PK tables)
+                const opts       = fkOptions[f.key] ?? [];
                 const inList     = opts.some(o => o[f.fkPk!] === currentVal);
                 const selectVal  = inList ? currentVal : currentVal ? "__custom__" : "";
                 return (
@@ -693,6 +884,19 @@ export function EntityCrud({ title, fields, pkField, api, buildTree }: Props) {
           <Button variant="contained" onClick={handleSave}>Save</Button>
         </DialogActions>
       </Dialog>
+
+      {/* ── FK IdPickerDialog (shared by all FK fields that have FK_CONFIG) ── */}
+      {fkPickerField && (
+        <IdPickerDialog
+          open={!!fkPickerField}
+          fieldName={fkPickerField}
+          currentValue={(form[fkPickerField] as string) ?? null}
+          onClose={() => setFkPickerField(null)}
+          onApply={(id) => {
+            setForm(p => ({ ...p, [fkPickerField!]: id }));
+          }}
+        />
+      )}
 
     </Box>
   );

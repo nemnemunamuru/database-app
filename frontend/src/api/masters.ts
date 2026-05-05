@@ -62,3 +62,22 @@ export const getColumnDef = (id: string) =>
   api.get<any>(`/api/masters/column-defs/${encodeURIComponent(id)}`).then(r => r.data);
 export const deleteFkByColumn = (columnName: string) =>
   api.delete(`/api/masters/column-defs/fk-by-column/${encodeURIComponent(columnName)}`);
+
+export const reorderColumnDefs = (items: { id: string; order_index: number }[]) =>
+  api.post("/api/masters/column-defs/reorder", items).then(r => r.data);
+
+// --- Trajectory type defs ---
+export interface TrajectoryTypeDef {
+  type_def_id: string;
+  parent: "main" | "sub";
+  type_name: string;
+  param_table: string;
+  pk_col: string;
+}
+export const trajectoryTypeDefsApi = {
+  list: () => api.get<TrajectoryTypeDef[]>("/api/masters/trajectory-type-defs"),
+  sync: () => api.post("/api/masters/trajectory-type-defs/sync"),
+};
+
+// --- Dynamic parameter table CRUD (slug = hyphenated table name) ---
+export const dynParamsApi = (slug: string) => crud(`dyn-params/${slug}`);
