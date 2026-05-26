@@ -1,11 +1,15 @@
-import { Fragment, useState } from "react";
+import { Fragment, useState, useEffect, useRef } from "react";
 import {
-  Box, Chip, Divider, IconButton, Paper, Tooltip, Typography,
+  Box, Chip, Divider, IconButton, Paper, Snackbar, Alert, Tooltip, Typography,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import EditIcon from "@mui/icons-material/Edit";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
+import WifiTetheringIcon from "@mui/icons-material/WifiTethering";
+import WifiTetheringOffIcon from "@mui/icons-material/WifiTetheringOff";
+import CheckCircleIcon from "@mui/icons-material/CheckCircle";
+import { useOct } from "../../context/OctContext";
 import type { ExperimentDetail } from "../../api/experiments";
 import type { Candidate } from "../masters/EntityCrud";
 import {
@@ -115,18 +119,87 @@ export function TreeBlock({ items, depth = 0, hideEmpty, candidatesMap = {} }: {
 
 // ── Detail panel ──────────────────────────────────────────────────────────────
 export function DetailPanel({
-  detail, onEdit, onClose, candidatesMap, extraExpCols = [], projectData,
+  detail, onEdit, onClose, candidatesMap, extraExpCols = [], projectData, showOctButton = false,
 }: {
   detail: ExperimentDetail;
   onEdit: () => void;
   onClose: () => void;
+  onOctReceived?: () => void;
   candidatesMap: Record<string, Candidate[]>;
   /** Ordered list of non-PK column defs for the EXPERIMENT table (from column_defs). */
   extraExpCols?: { column_name: string; is_id?: string }[];
   /** Raw project object (all columns). When provided the PROJECT section is built dynamically. */
   projectData?: Record<string, any>;
+  /** Show OCT Remote Mode button. Should be true only in New Project context. */
+  showOctButton?: boolean;
 }) {
   const [hideEmpty, setHideEmpty] = useState(false);
+
+  // ── OCT Remote Mode ──────────────────────────────────────────────────────
+  const [remoteMode, setRemoteMode] = useState(false);
+  const [octReceived, setOctReceived] = useState(false);
+  const [octSnack, setOctSnack] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { setOctWaiting } = useOct();
+
+  // 実験が切り替わったらリセット
+  useEffect(() => {
+    setRemoteMode(false);
+    setOctReceived(false);
+    setOctWaiting(false);
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, [detail.experiment_id]);
+
+  // コンポーネントアンマウント時
+  useEffect(() => {
+    return () => { setOctWaiting(false); if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  // ポーリング
+  useEffect(() => {
+    if (!remoteMode) return;
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch("/api/oct/status");
+        const data = await res.json();
+        if (data.received) {
+          setOctReceived(true);
+          setRemoteMode(false);
+          setOctWaiting(false);
+          setOctSnack(true);
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+          onOctReceived?.();
+        }
+      } catch (_) {}
+    }, 1000);
+    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
+  }, [remoteMode]);
+
+  const handleActivate = async () => {
+    try {
+      const params = detail.project_id ? `?project_id=${encodeURIComponent(detail.project_id)}` : "";
+      const res = await fetch(`/api/oct/activate/${detail.experiment_id}${params}`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${body}`);
+      }
+      setRemoteMode(true);
+      setOctWaiting(true);
+      setOctReceived(false);
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (msg.includes("Failed to fetch") || msg.includes("fetch")) {
+        alert("バックエンドサーバーに接続できません。\nuvicorn が起動しているか確認してください（port 8000）。");
+      } else {
+        alert(`OCT待受の開始に失敗しました。\n${msg}`);
+      }
+    }
+  };
+  const handleDeactivate = async () => {
+    await fetch("/api/oct/activate", { method: "DELETE" });
+    setRemoteMode(false);
+    setOctWaiting(false);
+  };
 
   const gs  = detail.galvano_system;
   const wc  = detail.welding_condition;
@@ -181,12 +254,33 @@ export function DetailPanel({
   }
 
   return (
+    <>
     <Paper elevation={3} sx={{ p: 1.5, minWidth: 300 }}>
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
         <Typography variant="caption" fontFamily="monospace" fontSize={10} color="text.secondary" noWrap sx={{ maxWidth: 180 }}>
           {detail.experiment_id}
         </Typography>
         <Box sx={{ display: "flex", gap: 0.3, alignItems: "center" }}>
+          {/* OCT 待受ボタン */}
+          {showOctButton && (
+          <Tooltip title={
+            octReceived ? "OCT データ受信済み" :
+            remoteMode  ? "OCT 待受中… (クリックで停止)" :
+                          "OCT 待受 ON"
+          }>
+            <IconButton
+              size="small"
+              onClick={remoteMode ? handleDeactivate : handleActivate}
+              sx={{ color: octReceived ? "success.main" : remoteMode ? "#9c27b0" : "action.active" }}
+            >
+              {octReceived
+                ? <CheckCircleIcon sx={{ fontSize: 14 }} />
+                : remoteMode
+                  ? <WifiTetheringIcon sx={{ fontSize: 14 }} />
+                  : <WifiTetheringOffIcon sx={{ fontSize: 14 }} />}
+            </IconButton>
+          </Tooltip>
+          )}
           <Tooltip title={hideEmpty ? "Show empty values" : "Hide empty values"}>
             <IconButton size="small" onClick={() => setHideEmpty(h => !h)} color={hideEmpty ? "primary" : "default"}>
               {hideEmpty ? <VisibilityOffIcon sx={{ fontSize: 14 }} /> : <VisibilityIcon sx={{ fontSize: 14 }} />}
@@ -206,5 +300,18 @@ export function DetailPanel({
         </Fragment>
       ))}
     </Paper>
+
+    {/* OCT 受信完了 Snackbar */}
+    <Snackbar
+      open={octSnack}
+      autoHideDuration={5000}
+      onClose={() => setOctSnack(false)}
+      anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+    >
+      <Alert severity="success" onClose={() => setOctSnack(false)} sx={{ fontSize: 13 }}>
+        OCT データを受信しました。詳細を再読み込みして確認してください。
+      </Alert>
+    </Snackbar>
+    </>
   );
 }

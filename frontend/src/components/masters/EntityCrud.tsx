@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, Fragment, useMemo, useRef } from "react";
 import {
-  Box, Button, Chip, CircularProgress, Dialog, DialogActions,
+  Box, Button, Checkbox, Chip, CircularProgress, Dialog, DialogActions,
   DialogContent, DialogTitle, Divider, FormControl, IconButton, InputAdornment,
   InputLabel, MenuItem, Paper, Select, Table, TableBody, TableCell,
   TableContainer, TableHead, TableRow, TextField, Tooltip, Typography,
@@ -13,6 +13,7 @@ import AddIcon from "@mui/icons-material/Add";
 import EditIcon from "@mui/icons-material/Edit";
 import DeleteIcon from "@mui/icons-material/Delete";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import CopyAllIcon from "@mui/icons-material/CopyAll";
 import CloseIcon from "@mui/icons-material/Close";
 import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
@@ -244,6 +245,7 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
   const [fkPickerField, setFkPickerField] = useState<string | null>(null);
   // Extra fields discovered from column_def (not in the static fields prop)
   const [extraFields, setExtraFields]     = useState<FieldDef[]>([]);
+  const [roleFields, setRoleFields]         = useState<string[]>([]);
   const { registerUndo } = useUndo();
 
   // Derive a FieldDef type from column_def data_type
@@ -289,6 +291,10 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
           type: deriveFieldType(row.data_type ?? 'string', row.column_name),
         }));
       setExtraFields(extra);
+      const roleFieldNames = primaryRows
+        .filter((row: any) => row.is_id === 'role')
+        .map((row: any) => row.column_name as string);
+      setRoleFields(roleFieldNames);
     } catch { /* ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [title, candidatesTables]);
@@ -354,10 +360,17 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
 
   const handleSave = async () => {
     const payload = { ...form };
-    for (const f of fields) {
+    for (const f of [...fields, ...extraFields]) {
       if (f.disabledWhen?.(form)) {
         const dv = f.defaultWhen?.(form);
         payload[f.key] = dv !== undefined ? dv : null;
+      }
+      // Coerce boolean fields: sentinel strings → true/false/null
+      if (f.type === "boolean" && f.key in payload) {
+        const v = payload[f.key];
+        if (v === "__true__"  || v === true  || v === 1) payload[f.key] = true;
+        else if (v === "__false__" || v === false || v === 0) payload[f.key] = false;
+        else payload[f.key] = null;
       }
     }
     if (editing) {
@@ -380,6 +393,30 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
     await api.remove(id);
     if (selectedId === id) { setSelectedId(null); setTreeNodes(null); }
     if (item) registerUndo("Delete", async () => { await api.create(item); load(); });
+    setCheckedIds((prev) => { const next = new Set(prev); next.delete(id); return next; });
+    load();
+  };
+
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
+
+  const handleCheckboxChange = (id: string, checked: boolean) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id); else next.delete(id);
+      return next;
+    });
+  };
+
+  const handleDeleteSelected = async () => {
+    if (checkedIds.size === 0) return;
+    if (!confirm(`Delete ${checkedIds.size} record(s)?`)) return;
+    for (const id of checkedIds) {
+      const item = items.find(i => i[pkField] === id);
+      await api.remove(id);
+      if (selectedId === id) { setSelectedId(null); setTreeNodes(null); }
+      if (item) registerUndo("Delete", async () => { await api.create(item); load(); });
+    }
+    setCheckedIds(new Set());
     load();
   };
 
@@ -403,6 +440,17 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
     load();
   };
 
+  const handleCloneWithSameId = (item: any) => {
+    setEditing(null);
+    const formInit = { ...item };
+    // Clear role fields so user must choose a new role value
+    for (const rf of roleFields) {
+      formInit[rf] = null;
+    }
+    setForm(formInit);
+    setOpen(true);
+  };
+
   const handleChange = (key: string, type: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
     setForm(prev => ({
@@ -421,18 +469,43 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
   useEffect(() => {
     const measure = () => {
       if (tableContainerRef.current) {
-        setPanelTop(Math.round(tableContainerRef.current.getBoundingClientRect().top));
+        const top = tableContainerRef.current.getBoundingClientRect().top;
+        // Only update if element is visible (top > 0 means it's rendered on screen)
+        if (top > 0) setPanelTop(Math.round(top));
       }
     };
     const raf = requestAnimationFrame(measure);
     window.addEventListener("resize", measure);
-    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", measure); };
+    window.addEventListener("scroll", measure);
+
+    // Re-measure when element becomes visible (e.g. tab switch from display:none)
+    let obs: IntersectionObserver | undefined;
+    if (tableContainerRef.current) {
+      obs = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting) {
+          requestAnimationFrame(measure);
+        }
+      });
+      obs.observe(tableContainerRef.current);
+    }
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure);
+      obs?.disconnect();
+    };
   }, [loading, items.length]);
 
   // Sort all fields (static + dynamic) by column_def order_index
   const orderedFields = useMemo(() => {
-    const all = [...fields, ...extraFields];
-    return [...all].sort((a, b) => (orderMap[a.key] ?? 9999) - (orderMap[b.key] ?? 9999));
+    const seen = new Set<string>();
+    const all = [...fields, ...extraFields].filter(f => {
+      if (seen.has(f.key)) return false;
+      seen.add(f.key);
+      return true;
+    });
+    return all.sort((a, b) => (orderMap[a.key] ?? 9999) - (orderMap[b.key] ?? 9999));
   }, [fields, extraFields, orderMap]);
 
   return (
@@ -440,7 +513,14 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
       {/* ── Header ── */}
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} mb={1}>
         {title ? <Typography variant="subtitle1" fontWeight="bold">{title}</Typography> : <Box />}
-        <Button size="small" variant="contained" startIcon={<AddIcon />} onClick={openAdd}>Add</Button>
+        <Box sx={{ display: "flex", gap: 1 }}>
+          {checkedIds.size > 0 && (
+            <Button size="small" variant="outlined" color="error" onClick={handleDeleteSelected}>
+              Delete ({checkedIds.size})
+            </Button>
+          )}
+          <Button size="small" variant="contained" startIcon={<AddIcon />} onClick={openAdd}>Add</Button>
+        </Box>
       </Box>
 
       {/* ── Table + side panel ── */}
@@ -452,6 +532,21 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
               <Table size="small" stickyHeader sx={{ tableLayout: "auto", "& tbody td": { paddingTop: "0 !important", paddingBottom: "0 !important", lineHeight: "1.4" } }}>
                 <TableHead>
                   <TableRow>
+                    <TableCell padding="checkbox" sx={{ width: 36 }}>
+                      <Checkbox
+                        size="small"
+                        checked={items.length > 0 && items.every(i => checkedIds.has(i[pkField]))}
+                        indeterminate={items.some(i => checkedIds.has(i[pkField])) && !items.every(i => checkedIds.has(i[pkField]))}
+                        onChange={(e) => {
+                          setCheckedIds((prev) => {
+                            const next = new Set(prev);
+                            if (e.target.checked) items.forEach(i => next.add(i[pkField]));
+                            else items.forEach(i => next.delete(i[pkField]));
+                            return next;
+                          });
+                        }}
+                      />
+                    </TableCell>
                     {pkField !== "_id" && <TableCell align="center" sx={{ fontWeight: "bold", whiteSpace: "nowrap" }}>{pkField}</TableCell>}
                     {orderedFields.filter(f => !f.hideInTable).map(f => (
                       <TableCell key={f.key} align="center" sx={{ fontWeight: "bold", whiteSpace: "nowrap" }}>{f.label}</TableCell>
@@ -463,14 +558,25 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
                   {items.map(item => {
                     const id    = item[pkField];
                     const isSel = selectedId === id;
+                    // Composite key for tables with role fields (composite PK)
+                    const rowKey = roleFields.length > 0
+                      ? id + "~" + roleFields.map(rf => item[rf] ?? "").join("~")
+                      : id;
                     return (
                       <TableRow
-                        key={id}
+                        key={rowKey}
                         hover
                         selected={isSel}
                         onClick={buildTree ? (e) => handleRowClick(item) : undefined}
                         sx={{ cursor: buildTree ? "pointer" : undefined, "& td": { paddingTop: "0 !important", paddingBottom: "0 !important" } }}
                       >
+                        <TableCell padding="checkbox" sx={{ width: 36 }} onClick={e => e.stopPropagation()}>
+                          <Checkbox
+                            size="small"
+                            checked={checkedIds.has(id)}
+                            onChange={(e) => handleCheckboxChange(id, e.target.checked)}
+                          />
+                        </TableCell>
                         {pkField !== "_id" && <TableCell align="center" style={{ paddingTop: 0, paddingBottom: 0 }} sx={{ fontFamily: "monospace", fontSize: 10, whiteSpace: "nowrap" }}>
                           <Tooltip title={String(id)}><span>{String(id).slice(0, 8) + "…"}</span></Tooltip>
                         </TableCell>}
@@ -530,6 +636,13 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
                                 </span>
                               </Tooltip>
                             </>
+                          )}
+                          {roleFields.length > 0 && (
+                            <Tooltip title="Copy (same ID)">
+                              <IconButton size="small" color="secondary" onClick={() => handleCloneWithSameId(item)}>
+                                <CopyAllIcon sx={{ fontSize: 14 }} />
+                              </IconButton>
+                            </Tooltip>
                           )}
                           <Tooltip title="Copy">
                             <IconButton size="small" onClick={() => handleClone(item)}>
@@ -675,7 +788,7 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
 
               // ── candidates enforcement: column_def has allowed values → Select with colors ──
               const fieldCandidates = candidatesMap[f.key];
-              if (fieldCandidates?.length && f.type !== "fk") {
+              if (fieldCandidates?.length && f.type !== "fk" && f.type !== "boolean") {
                 return (
                   <FormControl key={f.key} size="small" fullWidth disabled={isDisabled}>
                     <InputLabel>{f.label}</InputLabel>
@@ -810,6 +923,29 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
                       {f.options.map(opt => (
                         <MenuItem key={opt} value={opt}>{opt}</MenuItem>
                       ))}
+                    </Select>
+                  </FormControl>
+                );
+              }
+              if (f.type === "boolean") {
+                // Use unambiguous string sentinels: "__true__", "__false__", "__none__"
+                // Avoids MUI Select falsy-value issues with 0 or false
+                const raw = isDisabled ? (defaultValue ?? null) : form[f.key];
+                const boolSentinel =
+                  raw === true  || raw === 1 || raw === "true"  || raw === "__true__"  ? "__true__"
+                  : raw === false || raw === 0 || raw === "false" || raw === "__false__" ? "__false__"
+                  : "__none__";
+                return (
+                  <FormControl key={f.key} size="small" fullWidth disabled={isDisabled}>
+                    <InputLabel>{f.label}</InputLabel>
+                    <Select
+                      value={boolSentinel}
+                      label={f.label}
+                      onChange={(e) => setForm(prev => ({ ...prev, [f.key]: e.target.value }))}
+                    >
+                      <MenuItem value="__none__">— none —</MenuItem>
+                      <MenuItem value="__true__">✓ true</MenuItem>
+                      <MenuItem value="__false__">✗ false</MenuItem>
                     </Select>
                   </FormControl>
                 );

@@ -24,6 +24,8 @@ import type { Project, ProjectExperiment } from "../api/projects";
 import { projectsApi } from "../api/projects";
 import { fetchExperiments, fetchExperimentProjects } from "../api/experiments";
 import type { Experiment, ExperimentDetail } from "../api/experiments";
+import AnalysisTab from "../components/experiments/AnalysisTab";
+import { settingsApi } from "../api/settings";
 import ExpDeepEditDialog from "../components/projects/ExpDeepEditDialog";
 import MergeDiffDialog from "../components/projects/MergeDiffDialog";
 import type { ConflictItem } from "../components/projects/MergeDiffDialog";
@@ -748,6 +750,9 @@ export default function NewProjectPage() {
   const [cacheLoading, setCacheLoading]     = useState(false);
   const detailLoadingIds = useRef(new Set<string>());
 
+  const [subTab, setSubTab] = useState<number>(0);
+  const [triggerBatchReport, setTriggerBatchReport] = useState(false);
+
   // Dynamic panel top: align with TableContainer top
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const [panelTop, setPanelTop] = useState(200);
@@ -780,12 +785,13 @@ export default function NewProjectPage() {
     else setExperiments([]);
   }, [selectedId, loadExperiments]);
 
-  // Reset detail and filter when project changes
+  // Reset detail, filter and tab when project changes
   useEffect(() => {
     setSelectedExpId(null);
     setDeepDetail(null);
     setFilterState(FILTER_DEFAULT);
     setExpDetailCache({});
+    setSubTab(0);
     detailLoadingIds.current.clear();
   }, [selectedId]);
 
@@ -1073,6 +1079,27 @@ export default function NewProjectPage() {
       const totalSkipped  = Object.values(details).reduce((s, v) => s + (v.skipped  ?? 0), 0);
       const totalUpdated  = Object.values(details).reduce((s, v) => s + (v.updated  ?? 0), 0);
       setMergeResult({ inserted: totalInserted, total: totalInserted + totalSkipped + totalUpdated, updated: totalUpdated });
+
+      // Merge project analysis chart configs into EXPERIMENTS (main) analysis settings
+      try {
+        const settingsRes = await settingsApi.get("analysis_v5_all");
+        if (settingsRes.data.value) {
+          const parsed = JSON.parse(settingsRes.data.value);
+          const allItems: any[] = parsed.displayItems ?? [];
+          const projectItems = allItems.filter((i: any) => i.chartContext === selectedId);
+          if (projectItems.length > 0) {
+            // Copy project items as new main items (new id to avoid conflict)
+            const newMainItems = projectItems.map((i: any) => ({
+              ...i,
+              id: crypto.randomUUID(),
+              chartContext: "main",
+            }));
+            const merged = [...allItems, ...newMainItems];
+            await settingsApi.set("analysis_v5_all", JSON.stringify({ displayItems: merged }));
+          }
+        }
+      } catch { /* analysis merge is best-effort */ }
+
       setToast({ msg: `Merge complete: ${totalInserted} inserted / ${totalUpdated} updated`, sev: "success" });
     } catch {
       setToast({ msg: "Merge failed", sev: "error" });
@@ -1084,42 +1111,9 @@ export default function NewProjectPage() {
   // ── Markdown report download ──────────────────────────────────────────────
   const handleReportMd = async () => {
     if (!selectedId) return;
-    const url = `http://localhost:8000${projectsApi.reportMd(selectedId)}`;
-    const projName = selected?.name ?? "report";
-    const filename = `${projName}_report.md`;
-
-    try {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error("Failed to fetch report");
-      const blob = await res.blob();
-
-      // Use File System Access API if available (Chrome/Edge) → lets user pick save location
-      if ("showSaveFilePicker" in window) {
-        const handle = await (window as Window & typeof globalThis & {
-          showSaveFilePicker: (opts: unknown) => Promise<FileSystemFileHandle>
-        }).showSaveFilePicker({
-          suggestedName: filename,
-          types: [{ description: "Markdown file", accept: { "text/markdown": [".md"] } }],
-        });
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        setToast({ msg: "Markdown report saved", sev: "success" });
-      } else {
-        // Fallback: standard download
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = filename;
-        a.click();
-        URL.revokeObjectURL(a.href);
-        setToast({ msg: "Markdown report downloaded", sev: "success" });
-      }
-    } catch (err) {
-      // User cancelled the picker → no toast needed
-      if (err instanceof Error && err.name !== "AbortError") {
-        setToast({ msg: "Failed to generate report", sev: "error" });
-      }
-    }
+    // Switch to Analysis tab and trigger batch report (charts + data tables)
+    setSubTab(1);
+    setTriggerBatchReport(true);
   };
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1272,9 +1266,29 @@ export default function NewProjectPage() {
               </Alert>
             )}
 
-            <Divider sx={{ mb: 1.5 }} />
+            <Divider />
 
-            {/* Experiment table + detail panel */}
+            {/* Tabs: Experiment List | Analysis */}
+            <Tabs
+              value={subTab}
+              onChange={(_, v) => setSubTab(v)}
+              sx={{ borderBottom: 1, borderColor: "divider", mb: 1, minHeight: 36 }}
+              slotProps={{ indicator: { style: { height: 2 } } }}
+            >
+              <Tab label="Experiment List" sx={{ minHeight: 36, py: 0.5, fontSize: 13 }} />
+              <Tab label="Analysis" sx={{ minHeight: 36, py: 0.5, fontSize: 13 }} />
+            </Tabs>
+
+            {subTab === 1 && (
+              <AnalysisTab
+                key={selectedId ?? ""}
+                projectId={selectedId ?? undefined}
+                triggerBatchReport={triggerBatchReport}
+                onBatchReportDone={() => setTriggerBatchReport(false)}
+              />
+            )}
+
+            {subTab === 0 && (
             <Box sx={{ width: "100%" }}>
               <Box sx={{ mb: 1, paddingRight: (deepDetail !== null || deepLoading) ? "41vw" : 0 }}>
                 <ExperimentFilterBar
@@ -1378,6 +1392,7 @@ export default function NewProjectPage() {
                       candidatesMap={candidatesMap}
                       extraExpCols={orderedCols}
                       projectData={(deepDetail as any).project ?? undefined}
+                      showOctButton={true}
                       onEdit={() => {
                         const exp = experiments.find(e => e.experiment_id === selectedExpId);
                         if (exp) { setEditingExp(exp); setShowExpForm(true); }
@@ -1388,6 +1403,7 @@ export default function NewProjectPage() {
                 </Box>
               )}
             </Box>
+            )}
           </>
         )}
       </Box>

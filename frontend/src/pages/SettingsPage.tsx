@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useState } from "react";
 import {
   Box, Button, FormControlLabel, Paper, Switch,
-  Tab, Tabs, Typography,
+  Tab, Tabs, ToggleButton, ToggleButtonGroup, Tooltip, Typography,
 } from "@mui/material";
 import SchemaIcon from "@mui/icons-material/Schema";
 import PaletteIcon from "@mui/icons-material/Palette";
@@ -16,11 +16,20 @@ interface Props {
   darkMode: boolean;
   onToggleDark: (val: boolean) => void;
   isAdmin?: boolean;
+  chatbotSize?: "small" | "medium" | "large" | "xl";
+  onChangeChatbotSize?: (size: "small" | "medium" | "large" | "xl") => void;
 }
+
+const CHATBOT_SIZES = [
+  { value: "small",  label: "Small",  desc: "340 × 460" },
+  { value: "medium", label: "Medium", desc: "420 × 540" },
+  { value: "large",  label: "Large",  desc: "560 × 680" },
+  { value: "xl",     label: "XL",     desc: "700 × 820" },
+] as const;
 
 const COLUMN_DEF_FIELDS: FieldDef[] = [
   { key: "column_name", label: "column_name", type: "text",
-    endAdornment: (form) => form.is_id === "id" ? "_id" : undefined },
+    endAdornment: (form) => form.is_id === "id" ? "_id" : form.is_id === "role" ? "_role" : undefined },
   { key: "data_type",   label: "data_type",   type: "text",
     options: ["string", "float", "integer", "boolean", "text", "uuid", "date", "datetime", "path"],
     disabledWhen: (form) => form.is_id === "id",
@@ -28,7 +37,7 @@ const COLUMN_DEF_FIELDS: FieldDef[] = [
   { key: "unit",        label: "unit",        type: "text",
     disabledWhen: (form) => form.data_type === "date" || form.data_type === "datetime" },
   { key: "is_id",       label: "is_id",       type: "text",
-    options: ["id", ""],
+    options: ["id", "role", ""],
     disabledWhen: (form) => form.data_type === "date" || form.data_type === "datetime" },
   { key: "candidates",  label: "candidates",  type: "tags",
     disabledWhen: (form) => form.is_id === "id" || form.data_type === "date" || form.data_type === "datetime" },
@@ -78,12 +87,17 @@ function getTabColor(name: string): string {
 
 /** Convert "id" → "pk" if column_name matches table's own PK pattern, else "fk" */
 function resolveIsId(tableName: string, columnName: string, isIdInput: string): string {
-  if (isIdInput !== "id") return isIdInput ?? "";
-  const expectedPk = tableName.toLowerCase() + "_id";
-  return columnName === expectedPk ? "pk" : "fk";
+  if (isIdInput === "id") {
+    const expectedPk = tableName.toLowerCase() + "_id";
+    return columnName === expectedPk ? "pk" : "fk";
+  }
+  if (isIdInput === "role") {
+    return "role";
+  }
+  return isIdInput ?? "";
 }
 
-export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }: Props) {
+export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false, chatbotSize = "medium", onChangeChatbotSize }: Props) {
   const [tab, setTab] = useState(0);
 
   useEffect(() => { setTab(0); }, [isAdmin]);
@@ -170,13 +184,15 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
     return {
       ...base,
       create: async (data: any) => {
-        // Append _id suffix when is_id="id" (shown as endAdornment in the form)
+        // Append _id suffix when is_id="id", _role suffix when is_id="role"
         let columnName: string = data.column_name ?? "";
         if (data.is_id === "id") {
           columnName = columnName + "_id";
+        } else if (data.is_id === "role") {
+          columnName = columnName + "_role";
         }
 
-        // Resolve "id" → "pk" (own table's PK) or "fk" (foreign key)
+        // Resolve "id" → "pk"/"fk", "role" → "role"
         const isId = resolveIsId(activeTable, columnName, data.is_id ?? "");
 
         // Always create the row in the current table
@@ -371,13 +387,30 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false }
       {tab === (isAdmin ? 2 : 1) && (
         <Box sx={{ maxWidth: 600 }}>
           <Paper sx={{ p: 3 }}>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 2 }}>
               <SmartToyIcon color="primary" />
               <Typography variant="subtitle1" fontWeight="bold">AI Chatbot Settings</Typography>
             </Box>
-            <Typography variant="body2" color="text.secondary">
-              AI chatbot settings (OpenAI API key, model selection, etc.) are coming soon.
+
+            <Typography variant="body2" fontWeight={600} gutterBottom>
+              Window Size
             </Typography>
+            <Typography variant="body2" color="text.secondary" mb={1.5}>
+              Change the size of the AI Database Assistant dialog.
+            </Typography>
+            <ToggleButtonGroup
+              value={chatbotSize}
+              exclusive
+              onChange={(_, v) => { if (v && onChangeChatbotSize) onChangeChatbotSize(v); }}
+              size="small"
+            >
+              {CHATBOT_SIZES.map(s => (
+                <ToggleButton key={s.value} value={s.value} sx={{ px: 2.5, flexDirection: "column", lineHeight: 1.3 }}>
+                  <Typography variant="body2" fontWeight={700}>{s.label}</Typography>
+                  <Typography variant="caption" color="text.secondary">{s.desc}</Typography>
+                </ToggleButton>
+              ))}
+            </ToggleButtonGroup>
           </Paper>
         </Box>
       )}

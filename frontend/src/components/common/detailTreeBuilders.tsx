@@ -276,11 +276,13 @@ export function buildResultSection(res: any | null): TItem {
       { label: "spatter_flag",           value: <BoolChip v={res.spatter_flag} /> },
       { label: "spatter_severity",       value: f(res.spatter_severity) },
       { label: "gap_opening_flag",       value: <BoolChip v={res.gap_opening_flag} /> },
+      { label: "gap_opening_mm",         value: f(res.gap_opening_mm, " mm") },
       { label: "crack_flag",             value: <BoolChip v={res.crack_flag} /> },
       { label: "crack_severity",         value: f(res.crack_severity) },
       { label: "glass_contamination",    value: <BoolChip v={res.glass_contamination} /> },
       { label: "surface_contamination",  value: <BoolChip v={res.surface_contamination} /> },
       { label: "penetration_flag",       value: <BoolChip v={res.penetration_flag} /> },
+      { label: "dissimilar_material_flag", value: <BoolChip v={res.dissimilar_material_flag} /> },
       { label: "remarks",                value: f(res.remarks) },
     ] : [{ label: "(not set)", value: "" }],
   };

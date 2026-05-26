@@ -4,7 +4,6 @@ import {
 } from "@mui/material";
 import type { Experiment } from "../../api/experiments";
 import { createExperiment, updateExperiment } from "../../api/experiments";
-import IdSelectField from "../common/IdSelectField";
 
 interface Props {
   initial?: Experiment;
@@ -59,24 +58,27 @@ export default function ExperimentForm({ initial, onSaved, onCancel, onSavedAndN
       <Divider sx={{ mb: 2 }} />
       <Grid container spacing={2}>
         {[
-          "galvano_system_id",
-          "welding_condition_id",
-          "experiment_material_id",
-          "shielding_condition_id",
-          "result_id",
-          "observation_id",
-          "file_id",
-          "project_id",
-        ].map((key) => (
-          <Grid size={{ xs: 12, sm: 6 }} key={key}>
-            <IdSelectField
-              fieldName={key}
-              value={(form as Record<string, unknown>)[key] as string | null ?? null}
-              onChange={(v) => setForm((prev) => ({ ...prev, [key]: v }))}
+          { key: "galvano_system_id", label: "galvano_system_id" },
+          { key: "welding_condition_id", label: "welding_condition_id" },
+          { key: "experiment_material_id", label: "experiment_material_id" },
+          { key: "shielding_condition_id", label: "shielding_condition_id" },
+          { key: "result_id", label: "result_id" },
+          { key: "observation_id", label: "observation_id" },
+          { key: "file_id", label: "file_id" },
+          { key: "project_id", label: "project_id" },
+        ].map(({ key, label }) => (
+          <Grid item xs={12} sm={6} key={key}>
+            <TextField
+              fullWidth
+              size="small"
+              label={label}
+              value={(form as Record<string, unknown>)[key] ?? ""}
+              onChange={handleChange(key as keyof Experiment)}
+              placeholder="UUID または空欄"
             />
           </Grid>
         ))}
-        <Grid size={12}>
+        <Grid item xs={12}>
           <TextField
             fullWidth
             size="small"

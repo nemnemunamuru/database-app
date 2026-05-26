@@ -51,7 +51,7 @@ export interface ExperimentDetail extends Experiment {
       } | null;
     } | null;
   } | null;
-  experiment_material: Array<{
+  experiment_material: {
     material_role?: string; remarks?: string;
     material_state?: {
       thickness_mm?: number; width_mm?: number; length_mm?: number; surface_condition?: string; remarks?: string;
@@ -60,7 +60,7 @@ export interface ExperimentDetail extends Experiment {
         thermal_conductivity_w_mk?: number; reflectivity_1070nm?: number; remarks?: string;
       } | null;
     } | null;
-  }> | null;
+  } | null;
   shielding_condition: {
     gas_type?: string; gas_purity_percent?: number; gas_flow_l_min?: number; gas_pressure_kpa?: number;
     nozzle_type?: string; nozzle_diameter_mm?: number; nozzle_distance_mm?: number; nozzle_angle_deg?: number; remarks?: string;
@@ -112,12 +112,5 @@ export const cloneExperiment = (id: string) =>
 export const exportExperimentsCsv = () =>
   api.get("/api/io/export/experiments/csv", { responseType: "blob" });
 
-// ── Log file endpoints ────────────────────────────────────────────────────────
-export const listLogFiles = () =>
-  api.get<string[]>("/api/experiments/logs");
-
-export const getLogFile = (filename: string, downsample = 1) =>
-  api.get<{ headers: string[]; rows: Record<string, number>[] }>(
-    `/api/experiments/logs/${encodeURIComponent(filename)}`,
-    { params: { downsample } },
-  );
+export const getLogFile = (filename: string, ds: number) =>
+  api.get<{ headers: string[]; rows: any[][] }>(`/api/io/log-file/${encodeURIComponent(filename)}`, { params: { ds } });

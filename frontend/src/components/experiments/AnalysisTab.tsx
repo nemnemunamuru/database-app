@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import html2canvas from "html2canvas";
 import {
   Box, Button, Checkbox, Chip, CircularProgress, Collapse,
   Divider, FormControl, FormControlLabel, IconButton, InputLabel,
   Menu, MenuItem, Paper, Select, TextField, Typography,
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
+import DownloadIcon from "@mui/icons-material/Download";
+import FolderOpenIcon from "@mui/icons-material/FolderOpen";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import DeleteIcon from "@mui/icons-material/Delete";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import SaveIcon from "@mui/icons-material/Save";
@@ -13,7 +18,7 @@ import TuneIcon from "@mui/icons-material/Tune";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import {
-  CartesianGrid, Legend, Line, LineChart,
+  CartesianGrid, Legend, Line, LineChart, ReferenceArea,
   ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis,
 } from "recharts";
 
@@ -28,7 +33,7 @@ import { type FilterState, FILTER_DEFAULT, matchDeep } from "../../utils/experim
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type SeriesType    = "line" | "scatter";
-type ChartMode     = "2d" | "3d";
+type ChartMode     = "2d" | "3d" | "dist";
 type MarkerShape2D = "circle" | "square" | "triangle" | "diamond";
 
 interface SeriesStyle {
@@ -43,6 +48,24 @@ interface SeriesStyle {
   colormapCol: string;
   colormapMin: string;
   colormapMax: string;
+}
+
+interface PfSeriesConfig {
+  id: string;
+  yCol: string;
+  label: string;
+  color: string;
+  strokeWidth: number;
+  dashArray: string;
+  hidden?: boolean;
+}
+
+interface AvgRangeConfig {
+  id: string;
+  xMin: string;
+  xMax: string;
+  yCols: string[]; // empty = use all effectiveY
+  label: string;
 }
 
 interface DisplayItem {
@@ -66,6 +89,24 @@ interface DisplayItem {
   chartContext: string; // "main" or project_id
   showLegend: boolean;
   visible: boolean;
+  // X-range averages (multiple)
+  avgRanges: AvgRangeConfig[];
+  // Rolling percentile filter
+  pfEnabled: boolean;
+  pfWindowN: string;
+  pfPercent: string;
+  pfSeries: PfSeriesConfig[];
+  // Per-Y visibility
+  hiddenYCols: string[];
+  // Unified series render order (yCols names + pfSeries IDs, mixed)
+  seriesOrder?: string[];
+  // Distribution (heatmap) mode range + step
+  distXMin: string; distXMax: string;
+  distYMin: string; distYMax: string;
+  distXStep: string;
+  distYStep: string;
+  // Distribution colormap range
+  distCmapMin: string; distCmapMax: string;
 }
 
 interface ExpEntry {
@@ -196,6 +237,12 @@ function createDisplayItem(chartContext = "main"): DisplayItem {
     chartBgColor: "#ffffff", expanded: true, editing: true,
     xLabel: "", yLabel: "", xMin: "", xMax: "", yMin: "", yMax: "",
     chartContext, showLegend: true, visible: true,
+    avgRanges: [],
+    pfEnabled: false, pfWindowN: "11", pfPercent: "50", pfSeries: [],
+    hiddenYCols: [],
+    distXMin: "", distXMax: "", distYMin: "", distYMax: "",
+    distXStep: "", distYStep: "",
+    distCmapMin: "", distCmapMax: "",
   };
 }
 
@@ -210,6 +257,27 @@ const parseNum = (s: string): number | undefined => {
   const v = parseFloat(s);
   return isNaN(v) ? undefined : v;
 };
+
+/** Compute Nth percentile of a sorted or unsorted array */
+function calcPercentile(values: number[], p: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = (p / 100) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+/** Rolling percentile filter over a 1D array with window size n (odd) */
+function rollingPercentile(data: number[], n: number, p: number): number[] {
+  const half = Math.floor(n / 2);
+  return data.map((_, i) => {
+    const start = Math.max(0, i - half);
+    const end   = Math.min(data.length - 1, i + half);
+    const win   = data.slice(start, end + 1).filter(v => isFinite(v));
+    return win.length > 0 ? calcPercentile(win, p) : NaN;
+  });
+}
 
 /** Apply Z col as colormap col to all scatter series in 2D mode */
 function applyZColColormap(
@@ -396,8 +464,40 @@ const Hint = ({ children }: { children: React.ReactNode }) => (
   <Typography fontSize={12} color="text.secondary" sx={{ py:2, textAlign:"center" }}>{children}</Typography>
 );
 
+// ── Export directory persistence (IndexedDB) ──────────────────────────────────
+function openExportDB(): Promise<IDBDatabase> {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open("analysis_export", 1);
+    req.onupgradeneeded = e => (e.target as IDBOpenDBRequest).result.createObjectStore("handles");
+    req.onsuccess = e => res((e.target as IDBOpenDBRequest).result);
+    req.onerror  = e => rej((e.target as IDBOpenDBRequest).error);
+  });
+}
+async function saveExportDirHandle(handle: any) {
+  const db = await openExportDB();
+  const tx = db.transaction("handles", "readwrite");
+  tx.objectStore("handles").put(handle, "export_dir");
+  await new Promise(r => { tx.oncomplete = r; tx.onerror = r; });
+  db.close();
+}
+async function loadExportDirHandle(): Promise<any | null> {
+  const db = await openExportDB();
+  const tx = db.transaction("handles", "readonly");
+  const handle = await new Promise<any>(r => {
+    const req = tx.objectStore("handles").get("export_dir");
+    req.onsuccess = () => r(req.result ?? null);
+    req.onerror   = () => r(null);
+  });
+  db.close();
+  return handle;
+}
+
 // ── AnalysisTab ────────────────────────────────────────────────────────────────
-export default function AnalysisTab() {
+export default function AnalysisTab({ projectId, triggerBatchReport, onBatchReportDone }: {
+  projectId?: string;
+  triggerBatchReport?: boolean;
+  onBatchReportDone?: () => void;
+} = {}) {
   const [entries, setEntries]     = useState<ExpEntry[]>([]);
   const [mainRaw, setMainRaw]     = useState<Record<string,Experiment>>({});
   const [projRaw, setProjRaw]     = useState<Record<string,ProjectExperiment>>({});
@@ -418,8 +518,18 @@ export default function AnalysisTab() {
 
   const selectedExpIdRef   = useRef(selectedExpId);
   const displayItemsRef    = useRef(displayItems);
-  useEffect(()=>{ selectedExpIdRef.current = selectedExpId; }, [selectedExpId]);
-  useEffect(()=>{ displayItemsRef.current  = displayItems;  }, [displayItems]);
+  const loadingFilesRef    = useRef(new Set<string>());
+  const filteredEntriesRef = useRef<ExpEntry[]>([]);
+  useEffect(()=>{ selectedExpIdRef.current   = selectedExpId;    }, [selectedExpId]);
+  useEffect(()=>{ displayItemsRef.current    = displayItems;     }, [displayItems]);
+  useEffect(()=>{ loadingFilesRef.current    = loadingFiles;     }, [loadingFiles]);
+  const [batchExporting, setBatchExporting] = useState(false);
+  const [batchProgress, setBatchProgress]   = useState({ current:0, total:0 });
+  const batchCancelRef = useRef(false);
+  const batchReportTriggeredRef = useRef(false);
+  const [batchMenuAnchor, setBatchMenuAnchor] = useState<HTMLElement|null>(null);
+  const [exportWidth,  setExportWidth]  = useState("2000");
+  const [exportHeight, setExportHeight] = useState("2000");
 
   useEffect(() => {
     settingsApi.get(META_KEY).then(r => {
@@ -441,23 +551,33 @@ export default function AnalysisTab() {
     columnDefsApi.list().then(r => {
       setPathCols((r.data as any[]).filter(c=>c.data_type==="path").map(c=>`${c.table_name}::${c.column_name}`));
     }).catch(()=>{});
-    Promise.all([fetchExperiments({limit:2000}), projectsApi.list()]).then(async ([expRes,projRes]) => {
-      const mRaw: Record<string,Experiment>={};
-      expRes.data.items.forEach(e=>{mRaw[e.experiment_id]=e;});
-      setMainRaw(mRaw);
-      const pList: Project[] = projRes.data;
-      setProjects(pList);
-      const pRaw: Record<string,ProjectExperiment>={};
-      await Promise.all(pList.map(async p=>{
-        try {
-          const er=await projectsApi.listExperiments(p.project_id);
-          er.data.forEach(e=>{pRaw[e.experiment_id]=e;});
-        } catch{/***/}
-      }));
-      setProjRaw(pRaw);
-      // Only main experiments in the list
-      setEntries(expRes.data.items.map(e=>({experiment_id:e.experiment_id,remarks:e.remarks,source:"main" as const})));
-    }).catch(()=>{}).finally(()=>setLoading(false));
+    if (projectId) {
+      // Project-scoped: only load that project's experiments
+      projectsApi.listExperiments(projectId).then(r => {
+        const pRaw: Record<string,ProjectExperiment>={};
+        r.data.forEach(e=>{pRaw[e.experiment_id]=e;});
+        setProjRaw(pRaw);
+        setEntries(r.data.map(e=>({experiment_id:e.experiment_id,remarks:e.remarks,source:projectId})));
+      }).catch(()=>{}).finally(()=>setLoading(false));
+    } else {
+      Promise.all([fetchExperiments({limit:2000}), projectsApi.list()]).then(async ([expRes,projRes]) => {
+        const mRaw: Record<string,Experiment>={};
+        expRes.data.items.forEach(e=>{mRaw[e.experiment_id]=e;});
+        setMainRaw(mRaw);
+        const pList: Project[] = projRes.data;
+        setProjects(pList);
+        const pRaw: Record<string,ProjectExperiment>={};
+        await Promise.all(pList.map(async p=>{
+          try {
+            const er=await projectsApi.listExperiments(p.project_id);
+            er.data.forEach(e=>{pRaw[e.experiment_id]=e;});
+          } catch{/***/}
+        }));
+        setProjRaw(pRaw);
+        // Only main experiments in the list
+        setEntries(expRes.data.items.map(e=>({experiment_id:e.experiment_id,remarks:e.remarks,source:"main" as const})));
+      }).catch(()=>{}).finally(()=>setLoading(false));
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -528,6 +648,321 @@ export default function AnalysisTab() {
   const addItemWithContext = (ctx: string) =>
     setDisplayItems(prev=>[...prev, createDisplayItem(ctx)]);
   const removeItem = (id: string) => setDisplayItems(prev=>prev.filter(i=>i.id!==id));
+  const panelChartRefs = useRef<Map<string,HTMLElement>>(new Map());
+  const [exportDirName, setExportDirName] = useState<string>("");
+  const exportDirHandleRef = useRef<any>(null);
+
+  // Load persisted export dir handle on mount
+  useEffect(() => {
+    loadExportDirHandle().then(async h => {
+      if (!h) return;
+      try {
+        const perm = await h.queryPermission({ mode: "readwrite" });
+        if (perm === "granted") { exportDirHandleRef.current = h; setExportDirName(h.name); }
+      } catch {/* ignore */}
+    });
+  }, []);
+
+  const handleChoosePath = useCallback(async () => {
+    if (typeof (window as any).showDirectoryPicker !== "function") return;
+    try {
+      const dirHandle = await (window as any).showDirectoryPicker({ mode: "readwrite" });
+      exportDirHandleRef.current = dirHandle;
+      setExportDirName(dirHandle.name);
+      await saveExportDirHandle(dirHandle);
+    } catch (e: any) {
+      if (e?.name !== "AbortError") console.error(e);
+    }
+  }, []);
+
+  const ensureDirHandle = useCallback(async (): Promise<any|null> => {
+    if (typeof (window as any).showDirectoryPicker !== "function") return null;
+    let h = exportDirHandleRef.current;
+    if (h) {
+      try { const p = await h.requestPermission({ mode:"readwrite" }); if (p === "granted") return h; } catch{}
+    }
+    try {
+      h = await (window as any).showDirectoryPicker({ mode:"readwrite" });
+      exportDirHandleRef.current = h; setExportDirName(h.name);
+      await saveExportDirHandle(h); return h;
+    } catch (e:any) { if (e?.name !== "AbortError") console.error(e); return null; }
+  }, []);
+
+  const saveCanvases = useCallback(async (canvases: {canvas:HTMLCanvasElement;filename:string}[], dirHandle: any) => {
+    const tw = parseInt(exportWidth)||0, th = parseInt(exportHeight)||0;
+    const scale = (src: HTMLCanvasElement): HTMLCanvasElement => {
+      if (!tw && !th) return src;
+      const w = tw || Math.round(src.width * (th / src.height));
+      const h = th || Math.round(src.height * (tw / src.width));
+      const dst = document.createElement("canvas"); dst.width=w; dst.height=h;
+      dst.getContext("2d")!.drawImage(src, 0, 0, w, h);
+      return dst;
+    };
+    if (dirHandle) {
+      for (const {canvas, filename} of canvases) {
+        const blob = await new Promise<Blob>(res => scale(canvas).toBlob(b=>res(b!),"image/png"));
+        const fh = await dirHandle.getFileHandle(filename, {create:true});
+        const w = await fh.createWritable(); await w.write(blob); await w.close();
+      }
+    } else {
+      for (const {canvas, filename} of canvases) {
+        const a = document.createElement("a"); a.download = filename;
+        a.href = scale(canvas).toDataURL("image/png"); a.click();
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  }, [exportWidth, exportHeight]);
+
+  const handleExportAll = useCallback(async () => {
+    const expId = selectedExpId || "unknown";
+    const items = displayItemsRef.current.filter(item => item.visible !== false);
+    const canvases: { canvas: HTMLCanvasElement; filename: string }[] = [];
+    for (const item of items) {
+      const el = panelChartRefs.current.get(item.id);
+      if (!el) continue;
+      try {
+        const canvas = await html2canvas(el, { backgroundColor: "#ffffff", scale: 2, useCORS: true, logging: false,
+          ignoreElements: (e) => e.classList.contains("recharts-tooltip-wrapper") || e.classList.contains("recharts-tooltip-cursor") });
+        const safe = (item.title || item.id.slice(0,6)).replace(/[^\w\-\.]/g, "_");
+        canvases.push({ canvas, filename: `${expId}_${safe}.png` });
+      } catch (e) { console.error("Export failed:", e); }
+    }
+    if (canvases.length === 0) return;
+    const dirHandle = await ensureDirHandle();
+    await saveCanvases(canvases, dirHandle);
+  }, [selectedExpId, ensureDirHandle, saveCanvases]);
+
+  const handleExportReportMd = useCallback(async (targetCtx?: string) => {
+    const expId = selectedExpId || "analysis";
+    const projId = targetCtx || projectId || (selectedExpId ? mainRaw[selectedExpId]?.project_id : undefined);
+    const tw = parseInt(exportWidth)||0, th = parseInt(exportHeight)||0;
+    const scaleCanvas = (src: HTMLCanvasElement): HTMLCanvasElement => {
+      if (!tw && !th) return src;
+      const w = tw || Math.round(src.width * (th / src.height));
+      const h = th || Math.round(src.height * (tw / src.width));
+      const dst = document.createElement("canvas"); dst.width=w; dst.height=h;
+      dst.getContext("2d")!.drawImage(src, 0, 0, w, h);
+      return dst;
+    };
+
+    // Capture all visible charts
+    const chartFiles: { filename: string; title: string; canvas: HTMLCanvasElement }[] = [];
+    for (const item of displayItemsRef.current.filter(i => i.visible !== false)) {
+      const el = panelChartRefs.current.get(item.id);
+      if (!el) continue;
+      try {
+        const raw = await html2canvas(el, {
+          backgroundColor: "#ffffff", scale: 2, useCORS: true, logging: false,
+          ignoreElements: (e) => e.classList.contains("recharts-tooltip-wrapper") || e.classList.contains("recharts-tooltip-cursor"),
+        });
+        const title = item.title || item.id.slice(0, 6);
+        const safe = title.replace(/[^\w\-\.]/g, "_");
+        chartFiles.push({ filename: `${expId}_${safe}.png`, title, canvas: scaleCanvas(raw) });
+      } catch (e) { console.error(e); }
+    }
+
+    // Fetch project report text from backend
+    let reportText = "";
+    if (projId) {
+      try {
+        const res = await fetch(`http://localhost:8000/api/projects/${projId}/report/md`);
+        if (res.ok) reportText = await res.text();
+      } catch { /* ignore */ }
+    }
+
+    // Build markdown referencing PNG files by relative filename
+    let md = `# Analysis Report\n\n`;
+    if (expId !== "analysis") md += `**Experiment:** ${expId}\n\n`;
+    md += `## Charts\n\n`;
+    for (const { title, filename } of chartFiles) {
+      md += `### ${title}\n\n`;
+      md += `![${title}](${filename})\n\n`;
+    }
+    if (reportText) md += `---\n\n${reportText}`;
+
+    const mdFilename = `${expId}_report.md`;
+
+    // Get folder handle (prompts if not set)
+    const dirHandle = await ensureDirHandle();
+    if (dirHandle) {
+      // Save PNG files to folder
+      for (const { canvas, filename } of chartFiles) {
+        const blob = await new Promise<Blob>(res => canvas.toBlob(b => res(b!), "image/png"));
+        const fh = await dirHandle.getFileHandle(filename, { create: true });
+        const w = await fh.createWritable(); await w.write(blob); await w.close();
+      }
+      // Save MD file to same folder
+      const mdBlob = new Blob([md], { type: "text/markdown" });
+      const fh = await dirHandle.getFileHandle(mdFilename, { create: true });
+      const w = await fh.createWritable(); await w.write(mdBlob); await w.close();
+    } else {
+      // Fallback: download individual PNG files then MD
+      for (const { canvas, filename } of chartFiles) {
+        const a = document.createElement("a");
+        a.href = canvas.toDataURL("image/png");
+        a.download = filename; a.click();
+        await new Promise(r => setTimeout(r, 200));
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+      a.download = mdFilename; a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  }, [projectId, selectedExpId, mainRaw, ensureDirHandle, exportWidth, exportHeight]);
+
+  // ── Batch Report MD: all experiments → charts + project data tables ──────────
+  const handleBatchReportMd = useCallback(async () => {
+    const targets = filteredEntriesRef.current;
+    if (targets.length === 0 || !projectId) return;
+    const tw = parseInt(exportWidth)||0, th = parseInt(exportHeight)||0;
+    const scaleCanvas = (src: HTMLCanvasElement): HTMLCanvasElement => {
+      if (!tw && !th) return src;
+      const w = tw || Math.round(src.width * (th / src.height));
+      const h = th || Math.round(src.height * (tw / src.width));
+      const dst = document.createElement("canvas"); dst.width=w; dst.height=h;
+      dst.getContext("2d")!.drawImage(src, 0, 0, w, h);
+      return dst;
+    };
+    const dirHandle = await ensureDirHandle();
+
+    // Fetch project report data text (tables)
+    let reportText = "";
+    try {
+      const res = await fetch(`http://localhost:8000/api/projects/${projectId}/report/md`);
+      if (res.ok) reportText = await res.text();
+    } catch { /* ignore */ }
+
+    // Batch capture per experiment
+    batchCancelRef.current = false;
+    setBatchExporting(true);
+    setBatchProgress({ current: 0, total: targets.length });
+    const prevExpId = selectedExpIdRef.current;
+    let chartsMd = `## 分析グラフ\n\n`;
+    const allChartFiles: { filename: string; canvas: HTMLCanvasElement }[] = [];
+
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (batchCancelRef.current) break;
+        const entry = targets[i];
+        setBatchProgress({ current: i+1, total: targets.length });
+        setSelectedExpId(entry.experiment_id);
+        await new Promise(r => setTimeout(r, 300));
+        for (let w = 0; w < 150; w++) {
+          if (loadingFilesRef.current.size === 0) break;
+          await new Promise(r => setTimeout(r, 100));
+        }
+        await new Promise(r => setTimeout(r, 600));
+        chartsMd += `### ${entry.experiment_id}\n\n`;
+        for (const item of displayItemsRef.current.filter(i => i.visible !== false)) {
+          const el = panelChartRefs.current.get(item.id);
+          if (!el) continue;
+          try {
+            const raw = await html2canvas(el, {
+              backgroundColor: "#ffffff", scale: 2, useCORS: true, logging: false,
+              ignoreElements: (e) => e.classList.contains("recharts-tooltip-wrapper") || e.classList.contains("recharts-tooltip-cursor"),
+            });
+            const title = item.title || item.id.slice(0, 6);
+            const safe = title.replace(/[^\w\-\.]/g, "_");
+            const filename = `${entry.experiment_id}_${safe}.png`;
+            allChartFiles.push({ filename, canvas: scaleCanvas(raw) });
+            chartsMd += `![${title}](${filename})\n\n`;
+          } catch (e) { console.error(e); }
+        }
+      }
+    } finally {
+      setSelectedExpId(prevExpId);
+      setBatchExporting(false);
+      setBatchProgress({ current: 0, total: 0 });
+    }
+
+    // Tables first, then charts
+    const projName = projects.find(p => p.project_id === projectId)?.name ?? projectId.slice(0, 8);
+    const fullMd = reportText + `\n\n---\n\n` + chartsMd;
+    const mdFilename = `${projName}_report.md`;
+
+    if (dirHandle) {
+      for (const { canvas, filename } of allChartFiles) {
+        const blob = await new Promise<Blob>(res => canvas.toBlob(b => res(b!), "image/png"));
+        const fh = await dirHandle.getFileHandle(filename, { create: true });
+        const w = await fh.createWritable(); await w.write(blob); await w.close();
+      }
+      const mdBlob = new Blob([fullMd], { type: "text/markdown" });
+      const fh = await dirHandle.getFileHandle(mdFilename, { create: true });
+      const w = await fh.createWritable(); await w.write(mdBlob); await w.close();
+    } else {
+      for (const { canvas, filename } of allChartFiles) {
+        const a = document.createElement("a");
+        a.href = canvas.toDataURL("image/png");
+        a.download = filename; a.click();
+        await new Promise(r => setTimeout(r, 200));
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([fullMd], { type: "text/markdown" }));
+      a.download = mdFilename; a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  }, [projectId, ensureDirHandle, exportWidth, exportHeight, projects]);
+
+  // Watch triggerBatchReport prop — run once entries are loaded
+  useEffect(() => {
+    if (triggerBatchReport && !loading && entries.length > 0 && !batchReportTriggeredRef.current) {
+      batchReportTriggeredRef.current = true;
+      handleBatchReportMd().finally(() => {
+        batchReportTriggeredRef.current = false;
+        onBatchReportDone?.();
+      });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [triggerBatchReport, loading, entries.length]);
+
+  const handleBatchExport = useCallback(async (targetEntries?: ExpEntry[]) => {
+    const targets = targetEntries ?? filteredEntriesRef.current;
+    if (targets.length === 0) return;
+    const dirHandle = await ensureDirHandle();
+    batchCancelRef.current = false;
+    setBatchExporting(true);
+    setBatchProgress({ current:0, total:targets.length });
+    const prevExpId = selectedExpIdRef.current;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (batchCancelRef.current) break;
+        const entry = targets[i];
+        setBatchProgress({ current:i+1, total:targets.length });
+        setSelectedExpId(entry.experiment_id);
+        // Wait for React to re-render and trigger file loading
+        await new Promise(r => setTimeout(r, 300));
+        // Wait for file loading to complete (up to 15s)
+        for (let w = 0; w < 150; w++) {
+          if (loadingFilesRef.current.size === 0) break;
+          await new Promise(r => setTimeout(r, 100));
+        }
+        // Wait for chart render to complete
+        await new Promise(r => setTimeout(r, 600));
+        const canvases: { canvas: HTMLCanvasElement; filename: string }[] = [];
+        for (const item of displayItemsRef.current.filter(i=>i.visible!==false)) {
+          const el = panelChartRefs.current.get(item.id);
+          if (!el) continue;
+          try {
+            const canvas = await html2canvas(el, { backgroundColor:"#ffffff", scale:2, useCORS:true, logging:false,
+              ignoreElements: (e) => e.classList.contains("recharts-tooltip-wrapper") || e.classList.contains("recharts-tooltip-cursor") });
+            const safe = (item.title || item.id.slice(0,6)).replace(/[^\w\-\.]/g, "_");
+            canvases.push({ canvas, filename:`${entry.experiment_id}_${safe}.png` });
+          } catch (e) { console.error(e); }
+        }
+        await saveCanvases(canvases, dirHandle);
+      }
+    } finally {
+      setSelectedExpId(prevExpId);
+      setBatchExporting(false);
+      setBatchProgress({ current:0, total:0 });
+    }
+  }, [ensureDirHandle, saveCanvases]);
+
+  const moveItem = (id: string, dir: -1|1) => setDisplayItems(prev=>{
+    const idx=prev.findIndex(i=>i.id===id); if(idx<0) return prev;
+    const next=idx+dir; if(next<0||next>=prev.length) return prev;
+    const arr=[...prev]; [arr[idx],arr[next]]=[arr[next],arr[idx]]; return arr;
+  });
 
   const filteredEntries = useMemo(() => {
     if (!expFilter.value) return entries;
@@ -540,6 +975,7 @@ export default function AnalysisTab() {
       ),
     );
   }, [entries, expFilter, mainRaw, detailCache]);
+  useEffect(()=>{ filteredEntriesRef.current = filteredEntries; }, [filteredEntries]);
 
   /** Column names derived from the first loaded experiment — used by the filter bar dropdown. */
   const expCols = useMemo(
@@ -611,10 +1047,15 @@ export default function AnalysisTab() {
         <Box sx={{ maxHeight:230, overflowY:"auto", border:"1px solid", borderColor:"divider", borderRadius:1 }}>
           {grouped.map(group=>(
             <Box key={group.key}>
-              <Box sx={{ px:1.5, py:0.4, bgcolor:"grey.200", position:"sticky", top:0, zIndex:1 }}>
+              <Box sx={{ px:1.5, py:0.4, bgcolor:"grey.200", position:"sticky", top:0, zIndex:1, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
                 <Typography fontSize={10} fontWeight="bold" color="text.secondary">
-                  {group.key==="__none__" ? "EXPERIMENTS" : `Project: ${group.label}`}
+                  {group.key==="__none__" ? (projectId ? "PROJECT EXPERIMENTS" : "EXPERIMENTS") : `Project: ${group.label}`}
                 </Typography>
+                <Button size="small" variant="outlined" color="warning" disabled={batchExporting}
+                  onClick={()=>handleBatchExport(group.items)}
+                  sx={{ fontSize:9, py:0, px:0.5, minWidth:0, lineHeight:1.4 }}>
+                  Batch({group.items.length})
+                </Button>
               </Box>
               {group.items.map(e=>{
                 const sel=e.experiment_id===selectedExpId;
@@ -637,8 +1078,62 @@ export default function AnalysisTab() {
       <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
         <Typography variant="subtitle2" fontWeight="bold">Charts</Typography>
         <Button size="small" startIcon={<AddIcon/>} variant="contained"
-          onClick={e=>availableProjects.length>0?setAddMenuAnchor(e.currentTarget):addItemWithContext("main")}
+          onClick={e=>projectId?addItemWithContext(projectId):(availableProjects.length>0?setAddMenuAnchor(e.currentTarget):addItemWithContext("main"))}
           sx={{ ml:0.5 }}>Add Chart</Button>
+        <Button size="small" startIcon={<DownloadIcon/>} variant="outlined"
+          onClick={handleExportAll}
+          sx={{ ml:0.5 }}>
+          {exportDirName ? `Save → ${exportDirName}` : "Save Charts"}
+        </Button>
+        <Button size="small" startIcon={<FolderOpenIcon/>} variant="outlined" color="secondary"
+          onClick={handleChoosePath}
+          sx={{ fontSize:11 }}>
+          {exportDirName ? "Change Path" : "Choose Path"}
+        </Button>
+        {!batchExporting ? (
+          <>
+            <Button size="small" variant="outlined" color="warning"
+              onClick={e=>setBatchMenuAnchor(e.currentTarget)}
+              sx={{ fontSize:11 }}>
+              Batch Export ({filteredEntries.length})
+            </Button>
+            <Menu anchorEl={batchMenuAnchor} open={!!batchMenuAnchor} onClose={()=>setBatchMenuAnchor(null)}>
+              <MenuItem dense onClick={()=>{ setBatchMenuAnchor(null); handleBatchExport(); }}>
+                All ({filteredEntries.length})
+              </MenuItem>
+              <Divider/>
+              {grouped.map(g=>(
+                <MenuItem dense key={g.key} onClick={()=>{ setBatchMenuAnchor(null); handleBatchExport(g.items); }}>
+                  {g.key==="__none__" ? "EXPERIMENTS" : `Project: ${g.label}`} ({g.items.length})
+                </MenuItem>
+              ))}
+            </Menu>
+          </>
+        ) : (
+          <>
+            <Typography fontSize={11} color="warning.main" sx={{ alignSelf:"center" }}>
+              Exporting… {batchProgress.current}/{batchProgress.total}
+            </Typography>
+            <Button size="small" variant="contained" color="error"
+              onClick={()=>{ batchCancelRef.current = true; }}
+              sx={{ fontSize:11 }}>
+              Stop
+            </Button>
+          </>
+        )}
+        {/* Fixed export size */}
+        <Box sx={{ display:"flex", alignItems:"center", gap:0.4, ml:0.5 }}>
+          <Typography fontSize={10} color="text.secondary">W</Typography>
+          <TextField size="small" value={exportWidth} placeholder="auto"
+            onChange={e=>setExportWidth(e.target.value)}
+            inputProps={{ style:{fontSize:10, width:48, textAlign:"right"} }} sx={{ width:64 }}/>
+          <Typography fontSize={10} color="text.secondary">H</Typography>
+          <TextField size="small" value={exportHeight} placeholder="auto"
+            onChange={e=>setExportHeight(e.target.value)}
+            inputProps={{ style:{fontSize:10, width:48, textAlign:"right"} }} sx={{ width:64 }}/>
+          <Typography fontSize={10} color="text.secondary">px</Typography>
+        </Box>
+        {!projectId && (
         <Menu anchorEl={addMenuAnchor} open={!!addMenuAnchor} onClose={()=>setAddMenuAnchor(null)}>
           <MenuItem dense onClick={()=>{addItemWithContext("main");setAddMenuAnchor(null);}}>EXPERIMENTS</MenuItem>
           <Divider/>
@@ -648,10 +1143,11 @@ export default function AnalysisTab() {
             </MenuItem>
           ))}
         </Menu>
+        )}
       </Box>
 
       {/* ── EXPERIMENTS charts ── */}
-      {mainItems.length>0&&(
+      {!projectId&&mainItems.length>0&&(
         <Box>
           <Typography fontSize={11} fontWeight="bold" color="text.secondary" sx={{ mb:0.5 }}>EXPERIMENTS</Typography>
           <Box sx={{ display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:2, alignItems:"start" }}>
@@ -672,6 +1168,9 @@ export default function AnalysisTab() {
                   onRemove={()=>removeItem(item.id)}
                   onSave={draft=>handleSave(item.id,draft)}
                   onRefresh={()=>{ if(fn) refreshFile(fn,item.downsample); }}
+                  onMoveUp={idx>0?()=>moveItem(item.id,-1):undefined}
+                  onMoveDown={idx<mainItems.length-1?()=>moveItem(item.id,1):undefined}
+                  chartAreaRef={el=>{ if(el) panelChartRefs.current.set(item.id,el); else panelChartRefs.current.delete(item.id); }}
                 />
               );
             })}
@@ -680,11 +1179,25 @@ export default function AnalysisTab() {
       )}
 
       {/* ── Project charts (below EXPERIMENTS) ── */}
-      {projItemGroups.map(g=>(
+      {projItemGroups.filter(g=>{
+        if (projectId) return g.ctx === projectId;
+        if (selectedExpId) {
+          const selProj = mainRaw[selectedExpId]?.project_id;
+          if (selProj) return g.ctx === selProj;
+        }
+        return true;
+      }).map(g=>(
         <Box key={g.ctx}>
-          <Divider sx={{ my:0.5 }}>
+          <Box sx={{ display:"flex", alignItems:"center", gap:1, my:0.5 }}>
+            <Divider sx={{ flex:1 }}/>
             <Typography fontSize={11} fontWeight="bold" color="secondary.main">Project: {g.label}</Typography>
-          </Divider>
+            <Button size="small" variant="outlined" color="secondary"
+              onClick={()=>handleExportReportMd(g.ctx)}
+              sx={{ fontSize:10, py:0.2, px:0.8, minWidth:0 }}>
+              Report MD
+            </Button>
+            <Divider sx={{ flex:1 }}/>
+          </Box>
           <Box sx={{ display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:2, alignItems:"start" }}>
             {g.items.map((item,idx)=>{
               const fn=selectedEntry&&item.pathCol?resolveFilename(selectedEntry,item.pathCol,mainRaw,projRaw,detailCache):null;
@@ -703,6 +1216,9 @@ export default function AnalysisTab() {
                   onRemove={()=>removeItem(item.id)}
                   onSave={draft=>handleSave(item.id,draft)}
                   onRefresh={()=>{ if(fn) refreshFile(fn,item.downsample); }}
+                  onMoveUp={idx>0?()=>moveItem(item.id,-1):undefined}
+                  onMoveDown={idx<g.items.length-1?()=>moveItem(item.id,1):undefined}
+                  chartAreaRef={el=>{ if(el) panelChartRefs.current.set(item.id,el); else panelChartRefs.current.delete(item.id); }}
                 />
               );
             })}
@@ -710,7 +1226,7 @@ export default function AnalysisTab() {
         </Box>
       ))}
 
-      {displayItems.length===0 && (
+      {(projectId ? !projItemGroups.find(g=>g.ctx===projectId) : displayItems.length===0) && (
         <Paper sx={{p:4,textAlign:"center"}} elevation={1}>
           <Typography color="text.secondary" fontSize={13}>Click "Add Chart" to add a graph panel</Typography>
         </Paper>
@@ -730,11 +1246,14 @@ interface DisplayItemPanelProps {
   onUpdate: (patch: Partial<DisplayItem>)=>void;
   onRemove: ()=>void; onSave: (draft: Partial<DisplayItem>)=>void;
   onRefresh: ()=>void;
+  onMoveUp?: ()=>void; onMoveDown?: ()=>void;
+  chartAreaRef?: (el: HTMLElement|null)=>void;
 }
 
 function DisplayItemPanel({
   item, index, pathCols, selectedEntry, resolvedFile, availHeaders,
   rows, isLoadingFile, hasError, saving, accentColor, onUpdate, onRemove, onSave, onRefresh,
+  onMoveUp, onMoveDown, chartAreaRef,
 }: DisplayItemPanelProps) {
   // Local draft  Eall edit-panel changes live here until Save
   const [draft, setDraft] = useState<DisplayItem>(()=>({...item}));
@@ -757,6 +1276,15 @@ function DisplayItemPanel({
   const effectiveY = draft.yCols.filter(y=>availHeaders.includes(y));
   const effectiveZ = (draft.zCol&&availHeaders.includes(draft.zCol))?draft.zCol:"";
 
+  // Unified series order (Y cols + PF series IDs) respecting draft.seriesOrder
+  const settingsSeriesOrder = useMemo<string[]>(()=>{
+    const all=[...draft.yCols,...(draft.pfEnabled?(draft.pfSeries??[]).map(pf=>pf.id):[])];
+    if (!draft.seriesOrder||draft.seriesOrder.length===0) return all;
+    const vs=new Set(all); const ordered=draft.seriesOrder.filter(id=>vs.has(id));
+    const os=new Set(ordered); for(const id of all) if(!os.has(id)) ordered.push(id);
+    return ordered;
+  },[draft.yCols,draft.pfEnabled,draft.pfSeries,draft.seriesOrder]);
+
   const xColMissing  = !!draft.xCol&&availHeaders.length>0&&!availHeaders.includes(draft.xCol);
   const yColsMissing = draft.yCols.filter(y=>availHeaders.length>0&&!availHeaders.includes(y));
   const zColMissing  = !!draft.zCol&&availHeaders.length>0&&!availHeaders.includes(draft.zCol);
@@ -773,7 +1301,25 @@ function DisplayItemPanel({
     return result;
   }, [rows, availHeaders]);
 
-  // 2D chart data (include colormap cols in payload)
+  // ── PF computed data (shared by chartData2D and avgValues) ────────────────
+  const pfComputed = useMemo<Record<string, number[]>>(() => {
+    if (!rows || !draft.pfEnabled || (draft.pfSeries??[]).length === 0) return {};
+    const rawN = parseInt(draft.pfWindowN || "11", 10) || 11;
+    const n = rawN % 2 === 0 ? rawN + 1 : rawN;
+    const p = parseNum(draft.pfPercent || "50") ?? 50;
+    const result: Record<string, number[]> = {};
+    for (const pf of draft.pfSeries) {
+      // PF-on-PF: if yCol is a previous PF id, use that computed array
+      const srcData = availHeaders.includes(pf.yCol)
+        ? rows.map(r => r[pf.yCol])
+        : (result[pf.yCol] ?? null);
+      if (!srcData) continue;
+      result[pf.id] = rollingPercentile(srcData, n, p);
+    }
+    return result;
+  }, [rows, availHeaders, draft.pfEnabled, draft.pfSeries, draft.pfWindowN, draft.pfPercent]);
+
+  // 2D chart data with rolling percentile filter series
   const chartData2D = useMemo<Record<string,number|string>[]>(()=>{
     if (!rows||!effectiveX||effectiveY.length===0) return [];
     const extraCols=new Set<string>();
@@ -781,13 +1327,55 @@ function DisplayItemPanel({
       const s=draft.seriesStyles[col];
       if (s?.useColormap){const cc=s.colormapCol||col; if(cc&&availHeaders.includes(cc))extraCols.add(cc);}
     }
-    return rows.map(row=>{
+    return rows.map((row, i)=>{
       const pt: Record<string,number|string>={[effectiveX]:row[effectiveX]};
       for (const y of effectiveY) pt[y]=row[y];
       for (const ec of extraCols) pt[ec]=row[ec];
+      for (const pf of (draft.pfEnabled ? (draft.pfSeries??[]) : [])) {
+        if (pfComputed[pf.id] !== undefined) pt[pf.id] = pfComputed[pf.id][i];
+      }
       return pt;
     });
-  }, [rows, effectiveX, effectiveY, draft.seriesStyles, availHeaders]);
+  }, [rows, effectiveX, effectiveY, draft.seriesStyles, availHeaders, draft.pfEnabled, draft.pfSeries, pfComputed]);
+
+  // X-range average values — uses chartData2D rows so PF series are included
+  const avgValues = useMemo<{rangeId:string;rangeLabel:string;col:string;colLabel:string;val:number;color:string}[]>(()=>{
+    if (!effectiveX || !chartData2D.length) return [];
+    const ranges = draft.avgRanges ?? [];
+    if (ranges.length === 0) return [];
+    // Build a color/label map for PF series
+    const pfColorMap: Record<string, string> = {};
+    const pfLabelMap: Record<string, string> = {};
+    for (const pf of (draft.pfSeries ?? [])) {
+      pfColorMap[pf.id] = pf.color;
+      pfLabelMap[pf.id] = pf.label || `${pf.yCol}_pf`;
+    }
+    const result: {rangeId:string;rangeLabel:string;col:string;colLabel:string;val:number;color:string}[] = [];
+    for (const ar of ranges) {
+      const xMin = parseNum(ar.xMin ?? "");
+      const xMax = parseNum(ar.xMax ?? "");
+      const inRange = chartData2D.filter(r => {
+        const x = r[effectiveX] as number;
+        return (xMin === undefined || x >= xMin) && (xMax === undefined || x <= xMax);
+      });
+      if (inRange.length === 0) continue;
+      // Raw Y cols + PF series
+      const pfCols = draft.pfEnabled ? (draft.pfSeries ?? []).map(pf => pf.id) : [];
+      const allCols = [...effectiveY, ...pfCols];
+      const targetCols = ar.yCols.length > 0 ? ar.yCols.filter(c => allCols.includes(c)) : allCols;
+      for (const col of targetCols) {
+        const isPf = pfCols.includes(col);
+        const i = effectiveY.indexOf(col);
+        const color = isPf ? (pfColorMap[col] ?? "#888") : getSeriesStyle(draft.seriesStyles, col, i).color;
+        const colLabel = isPf ? (pfLabelMap[col] ?? col) : col;
+        const sum = inRange.reduce((s, r) => s + ((r[col] as number) ?? 0), 0);
+        result.push({ rangeId: ar.id, rangeLabel: ar.label, col, colLabel, val: sum / inRange.length, color });
+      }
+    }
+    return result;
+  }, [draft.avgRanges, effectiveX, effectiveY, chartData2D, draft.pfEnabled, draft.pfSeries, draft.seriesStyles]);
+
+
 
   // 2D dot renderers (scatter only)
   const dotRenderers = useMemo(()=>{
@@ -832,12 +1420,50 @@ function DisplayItemPanel({
 
   // Z col change: auto-apply colormap to scatter series (works for both 2D and 3D)
   const handleZColChange = (newZCol: string) => {
-    draftUpdate(applyZColColormap(draft, newZCol));
+    const patch = applyZColColormap(draft, newZCol);
+    draftUpdate(patch);
+    onUpdate(patch);
   };
 
   const fileReady = !isLoadingFile&&!hasError&&!!resolvedFile&&!!selectedEntry&&!!draft.pathCol;
   const ready2D   = fileReady&&draft.chartMode==="2d"&&!!effectiveX&&effectiveY.length>0;
   const ready3D   = fileReady&&draft.chartMode==="3d"&&!!effectiveX&&effectiveY.length>0&&!!effectiveZ;
+  const readyDist = fileReady&&draft.chartMode==="dist"&&!!effectiveX&&effectiveY.length>0;
+
+  // Distribution heatmap data
+  const distData = useMemo(()=>{
+    if (!readyDist||!rows||rows.length===0) return null;
+    const yCol = effectiveY[0];
+    const allX = rows.map(r=>r[effectiveX] as number).filter(v=>isFinite(v));
+    const allY = rows.map(r=>r[yCol] as number).filter(v=>isFinite(v));
+    if (allX.length===0||allY.length===0) return null;
+    const xMin = parseNum(draft.distXMin)??Math.min(...allX);
+    const xMax = parseNum(draft.distXMax)??Math.max(...allX);
+    const yMin = parseNum(draft.distYMin)??Math.min(...allY);
+    const yMax = parseNum(draft.distYMax)??Math.max(...allY);
+    if (xMin>=xMax||yMin>=yMax) return null;
+    const xStep = parseNum(draft.distXStep)??((xMax-xMin)/20);
+    const yStep = parseNum(draft.distYStep)??((yMax-yMin)/20);
+    if (xStep<=0||yStep<=0) return null;
+    const xNum = Math.max(1,Math.floor((xMax-xMin)/xStep));
+    const yNum = Math.max(1,Math.floor((yMax-yMin)/yStep));
+    if (xNum>500||yNum>500) return null;
+    const dist: number[][] = Array.from({length:yNum},()=>new Array(xNum).fill(0));
+    let total = 0;
+    for (const row of rows) {
+      const x = row[effectiveX] as number;
+      const y = row[yCol] as number;
+      if (!isFinite(x)||!isFinite(y)) continue;
+      const xi = Math.floor((x-xMin)/xStep);
+      const yi = Math.floor((y-yMin)/yStep);
+      if (xi>=0&&xi<xNum&&yi>=0&&yi<yNum) { dist[yi][xi]++; total++; }
+    }
+    if (total===0) return null;
+    const pct = dist.map(row=>row.map(v=>v/total*100));
+    const maxPct = Math.max(...pct.flat());
+    return { pct, xMin, xMax, xStep, xNum, yMin, yMax, yStep, yNum,
+             xCol:effectiveX, yCol, total, maxPct };
+  },[readyDist, rows, effectiveX, effectiveY, draft.distXMin, draft.distXMax, draft.distYMin, draft.distYMax, draft.distXStep, draft.distYStep]);
 
   const xDomain: [any,any]|undefined=(draft.xMin!==""||draft.xMax!=="")
     ?[parseNum(draft.xMin)??"auto",parseNum(draft.xMax)??"auto"]:undefined;
@@ -856,7 +1482,7 @@ function DisplayItemPanel({
       }}>
         <Typography fontSize={12} fontWeight="bold" color="text.secondary" sx={{ mr:0.3 }}>#{index+1}</Typography>
         <TextField size="small" variant="standard" placeholder="Title"
-          value={item.title} onChange={e=>onUpdate({title:e.target.value})}
+          value={item.title} onChange={e=>{ onUpdate({title:e.target.value}); draftUpdate({title:e.target.value}); }}
           inputProps={{ style:{fontSize:13,fontWeight:"bold"} }} sx={{ flexGrow:1, minWidth:60 }}
         />
         {/* Downsample */}
@@ -898,6 +1524,8 @@ function DisplayItemPanel({
           startIcon={<RestartAltIcon fontSize="small"/>}
           onClick={()=>{ const f=createDisplayItem(); setDraft({...f,id:draft.id,title:draft.title,pathCol:draft.pathCol,expanded:draft.expanded,editing:draft.editing}); }}>Reset</Button>
         <IconButton size="small" color="error" onClick={onRemove}><DeleteIcon fontSize="small"/></IconButton>
+        <IconButton size="small" onClick={onMoveUp} disabled={!onMoveUp} title="Move left"><ArrowUpwardIcon fontSize="small"/></IconButton>
+        <IconButton size="small" onClick={onMoveDown} disabled={!onMoveDown} title="Move right"><ArrowDownwardIcon fontSize="small"/></IconButton>
       </Box>
 
       <Collapse in={item.expanded && item.visible !== false}>
@@ -921,7 +1549,7 @@ function DisplayItemPanel({
               )}
               <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
                 <Typography fontSize={12} color="text.secondary">Mode:</Typography>
-                {(["2d","3d"] as ChartMode[]).map(m=>(
+                {(["2d","3d","dist"] as ChartMode[]).map(m=>(
                   <Button key={m} size="small" variant={draft.chartMode===m?"contained":"outlined"}
                     onClick={()=>draftUpdate({chartMode:m})} sx={{ fontSize:11, minWidth:38, py:0.2 }}
                   >{m.toUpperCase()}</Button>
@@ -952,7 +1580,7 @@ function DisplayItemPanel({
                   <Box sx={{ display:"flex", gap:0.4, flexWrap:"wrap" }}>
                     {availHeaders.map(h=>(
                       <Button key={h} size="small" variant={item.xCol===h?"contained":"outlined"}
-                        onClick={()=>onUpdate({xCol:h,yCols:item.yCols.filter(y=>y!==h)})}
+                        onClick={()=>{const p={xCol:h,yCols:item.yCols.filter(y=>y!==h)};onUpdate(p);draftUpdate(p);}}
                         sx={{ fontSize:11, py:0.1, minWidth:50 }}>{h}</Button>
                     ))}
                   </Box>
@@ -960,19 +1588,80 @@ function DisplayItemPanel({
                 {/* Y */}
                 <Box>
                   <Typography variant="caption" color="text.secondary" display="block" sx={{ mb:0.3 }}>
-                    {item.chartMode==="3d"?"Y axis (pick one)":"Y axis (multi-select)"}
+                    {item.chartMode==="3d"?"Y axis (pick one)":"Y axis / series order (↑↓ to reorder)"}
                     {yColsMissing.length>0&&<Chip label={`"${yColsMissing.join(", ")}" not found`} size="small" color="warning" sx={{ml:1,fontSize:10}}/>}
+                    {(draft.hiddenYCols??[]).length>0&&(
+                      <Chip label="Show all" size="small" color="default" sx={{ml:1,fontSize:10,cursor:"pointer"}}
+                        onClick={()=>{onUpdate({hiddenYCols:[]});draftUpdate({hiddenYCols:[]});}}/>
+                    )}
                   </Typography>
+                  {/* Unified series list: Y cols + PF series in one reorderable list */}
+                  {settingsSeriesOrder.length > 0 && (
+                    <Box sx={{ display:"flex", flexDirection:"column", gap:0.3, mb:0.5, maxHeight:200, overflowY:"auto" }}>
+                      {settingsSeriesOrder.map((id, si) => {
+                        const isYCol = draft.yCols.includes(id);
+                        const pf = !isYCol ? (draft.pfSeries??[]).find(p=>p.id===id) : undefined;
+                        const isHidden = isYCol ? (draft.hiddenYCols??[]).includes(id) : (pf?.hidden ?? false);
+                        return (
+                          <Box key={id} sx={{ display:"flex", alignItems:"center", gap:0.3,
+                            bgcolor: isHidden ? "grey.100" : (isYCol ? "primary.50" : "grey.50"),
+                            border:"1px solid",
+                            borderColor: isHidden ? "grey.300" : (isYCol ? "primary.200" : (pf?.color??"grey.300")),
+                            borderRadius:0.5, px:0.5, py:0.2 }}>
+                            <IconButton size="small" sx={{ p:0.2 }}
+                              onClick={()=>{
+                                if (isYCol) {
+                                  const hidden=draft.hiddenYCols??[];
+                                  const p={hiddenYCols:hidden.includes(id)?hidden.filter(c=>c!==id):[...hidden,id]};
+                                  onUpdate(p); draftUpdate(p);
+                                } else {
+                                  const ns=[...(draft.pfSeries??[])]; const pi=ns.findIndex(p=>p.id===id);
+                                  if(pi>=0){ns[pi]={...ns[pi],hidden:!ns[pi].hidden}; draftUpdate({pfSeries:ns}); onUpdate({pfSeries:ns});}
+                                }
+                              }}>
+                              {isHidden
+                                ?<VisibilityOffIcon sx={{fontSize:13,color:"warning.main"}}/>
+                                :<VisibilityIcon sx={{fontSize:13,color:"primary.main"}}/>}
+                            </IconButton>
+                            <Typography fontSize={11} sx={{ flex:1, fontWeight:500, color:isYCol?"text.primary":"primary.main" }}>
+                              {isYCol ? id : (pf?.label || `${pf?.yCol}_pf`)}
+                            </Typography>
+                            {!isYCol&&<Typography fontSize={9} sx={{ bgcolor:"primary.50", color:"primary.main", px:0.4, borderRadius:0.5, flexShrink:0 }}>PF</Typography>}
+                            {isYCol&&availHeaders.length>0&&!availHeaders.includes(id)&&<Typography fontSize={9} color="warning.main" sx={{flexShrink:0}}>!</Typography>}
+                            <IconButton size="small" disabled={si===0} sx={{ p:0.2 }}
+                              onClick={()=>{
+                                const ns=[...settingsSeriesOrder]; [ns[si-1],ns[si]]=[ns[si],ns[si-1]];
+                                draftUpdate({seriesOrder:ns}); onUpdate({seriesOrder:ns});
+                              }}>
+                              <ArrowUpwardIcon sx={{ fontSize:13 }}/>
+                            </IconButton>
+                            <IconButton size="small" disabled={si===settingsSeriesOrder.length-1} sx={{ p:0.2 }}
+                              onClick={()=>{
+                                const ns=[...settingsSeriesOrder]; [ns[si+1],ns[si]]=[ns[si],ns[si+1]];
+                                draftUpdate({seriesOrder:ns}); onUpdate({seriesOrder:ns});
+                              }}>
+                              <ArrowDownwardIcon sx={{ fontSize:13 }}/>
+                            </IconButton>
+                            {isYCol&&(
+                              <IconButton size="small" color="error" sx={{ p:0.2 }}
+                                onClick={()=>{const p={yCols:draft.yCols.filter(y=>y!==id)};onUpdate(p);draftUpdate(p);}}>
+                                <DeleteIcon sx={{ fontSize:13 }}/>
+                              </IconButton>
+                            )}
+                          </Box>
+                        );
+                      })}
+                    </Box>
+                  )}
+                  {/* Unselected headers to add */}
                   <Box sx={{ display:"flex", gap:0.3, flexWrap:"wrap" }}>
-                    {availHeaders.filter(h=>h!==item.xCol&&(item.chartMode==="2d"||h!==item.zCol)).map(h=>(
-                      <FormControlLabel key={h}
-                        control={<Checkbox size="small" sx={{py:0.2}} checked={item.yCols.includes(h)}
-                          onChange={e=>{
-                            const yCols=item.chartMode==="3d"?(e.target.checked?[h]:[]):e.target.checked?[...item.yCols,h]:item.yCols.filter(y=>y!==h);
-                            onUpdate({yCols});
-                          }}/>}
-                        label={<Typography fontSize={11}>{h}</Typography>} sx={{ mr:0.5 }}
-                      />
+                    {availHeaders.filter(h=>h!==item.xCol&&!item.yCols.includes(h)&&(item.chartMode==="2d"||h!==item.zCol)).map(h=>(
+                      <Button key={h} size="small" variant="outlined" color="inherit"
+                        onClick={()=>{
+                          const yCols = item.chartMode==="3d" ? [h] : [...item.yCols, h];
+                          onUpdate({yCols}); draftUpdate({yCols});
+                        }}
+                        sx={{ fontSize:10, py:0.1, minWidth:40, color:"text.secondary", borderColor:"grey.300" }}>+ {h}</Button>
                     ))}
                   </Box>
                 </Box>
@@ -1002,38 +1691,96 @@ function DisplayItemPanel({
             <Box>
               <Typography variant="caption" color="text.secondary" display="block" sx={{ mb:0.5 }}>Axis labels &amp; ranges</Typography>
               <Box sx={{ display:"flex", flexDirection:"column", gap:0.6 }}>
-                <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
-                  <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>X</Typography>
-                  <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
-                    <Typography fontSize={10} color="text.secondary">Label</Typography>
-                    <TextField size="small" value={localXL} placeholder={effectiveX||"X"}
-                      onChange={e=>setLocalXL(e.target.value)} onBlur={()=>draftUpdate({xLabel:localXL})}
-                      onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({xLabel:localXL});(e.target as HTMLInputElement).blur();}}}
-                      inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
-                  </Box>
-                  <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
-                    <Typography fontSize={10} color="text.secondary">Range</Typography>
-                    <NumInput value={draft.xMin} width={60} onChange={v=>draftUpdate({xMin:v})}/>
-                    <Typography fontSize={10}>~</Typography>
-                    <NumInput value={draft.xMax} width={60} onChange={v=>draftUpdate({xMax:v})}/>
-                  </Box>
-                </Box>
-                <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
-                  <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>Y</Typography>
-                  <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
-                    <Typography fontSize={10} color="text.secondary">Label</Typography>
-                    <TextField size="small" value={localYL} placeholder={effectiveY.join(",")||"Y"}
-                      onChange={e=>setLocalYL(e.target.value)} onBlur={()=>draftUpdate({yLabel:localYL})}
-                      onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({yLabel:localYL});(e.target as HTMLInputElement).blur();}}}
-                      inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
-                  </Box>
-                  <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
-                    <Typography fontSize={10} color="text.secondary">Range</Typography>
-                    <NumInput value={draft.yMin} width={60} onChange={v=>draftUpdate({yMin:v})}/>
-                    <Typography fontSize={10}>~</Typography>
-                    <NumInput value={draft.yMax} width={60} onChange={v=>draftUpdate({yMax:v})}/>
-                  </Box>
-                </Box>
+                {draft.chartMode !== "dist" ? (
+                  <>
+                    <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                      <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>X</Typography>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
+                        <Typography fontSize={10} color="text.secondary">Label</Typography>
+                        <TextField size="small" value={localXL} placeholder={effectiveX||"X"}
+                          onChange={e=>setLocalXL(e.target.value)} onBlur={()=>draftUpdate({xLabel:localXL})}
+                          onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({xLabel:localXL});(e.target as HTMLInputElement).blur();}}}
+                          inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Range</Typography>
+                        <NumInput value={draft.xMin} width={60} onChange={v=>draftUpdate({xMin:v})}/>
+                        <Typography fontSize={10}>~</Typography>
+                        <NumInput value={draft.xMax} width={60} onChange={v=>draftUpdate({xMax:v})}/>
+                      </Box>
+                    </Box>
+                    <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                      <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>Y</Typography>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
+                        <Typography fontSize={10} color="text.secondary">Label</Typography>
+                        <TextField size="small" value={localYL} placeholder={effectiveY.join(",")||"Y"}
+                          onChange={e=>setLocalYL(e.target.value)} onBlur={()=>draftUpdate({yLabel:localYL})}
+                          onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({yLabel:localYL});(e.target as HTMLInputElement).blur();}}}
+                          inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Range</Typography>
+                        <NumInput value={draft.yMin} width={60} onChange={v=>draftUpdate({yMin:v})}/>
+                        <Typography fontSize={10}>~</Typography>
+                        <NumInput value={draft.yMax} width={60} onChange={v=>draftUpdate({yMax:v})}/>
+                      </Box>
+                    </Box>
+                  </>
+                ) : (
+                  <>
+                    <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                      <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>X</Typography>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
+                        <Typography fontSize={10} color="text.secondary">Label</Typography>
+                        <TextField size="small" value={localXL} placeholder={effectiveX||"X"}
+                          onChange={e=>setLocalXL(e.target.value)} onBlur={()=>draftUpdate({xLabel:localXL})}
+                          onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({xLabel:localXL});(e.target as HTMLInputElement).blur();}}}
+                          inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Range</Typography>
+                        <NumInput value={draft.distXMin} width={60} onChange={v=>draftUpdate({distXMin:v})}/>
+                        <Typography fontSize={10}>~</Typography>
+                        <NumInput value={draft.distXMax} width={60} onChange={v=>draftUpdate({distXMax:v})}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Step</Typography>
+                        <NumInput value={draft.distXStep} width={60} onChange={v=>draftUpdate({distXStep:v})}/>
+                      </Box>
+                    </Box>
+                    <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                      <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>Y</Typography>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
+                        <Typography fontSize={10} color="text.secondary">Label</Typography>
+                        <TextField size="small" value={localYL} placeholder={effectiveY.join(",")||"Y"}
+                          onChange={e=>setLocalYL(e.target.value)} onBlur={()=>draftUpdate({yLabel:localYL})}
+                          onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({yLabel:localYL});(e.target as HTMLInputElement).blur();}}}
+                          inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Range</Typography>
+                        <NumInput value={draft.distYMin} width={60} onChange={v=>draftUpdate({distYMin:v})}/>
+                        <Typography fontSize={10}>~</Typography>
+                        <NumInput value={draft.distYMax} width={60} onChange={v=>draftUpdate({distYMax:v})}/>
+                      </Box>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Step</Typography>
+                        <NumInput value={draft.distYStep} width={60} onChange={v=>draftUpdate({distYStep:v})}/>
+                      </Box>
+                    </Box>
+                    <Typography fontSize={10} color="text.secondary" sx={{ pl:"20px" }}>(range &amp; step: auto if blank)</Typography>
+                    <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                      <Typography fontSize={11} color="text.secondary" sx={{ minWidth:14 }}>C</Typography>
+                      <Box sx={{ display:"flex", alignItems:"center", gap:0.4 }}>
+                        <Typography fontSize={10} color="text.secondary">Cmap</Typography>
+                        <NumInput value={draft.distCmapMin} width={60} onChange={v=>draftUpdate({distCmapMin:v})}/>
+                        <Typography fontSize={10}>~</Typography>
+                        <NumInput value={draft.distCmapMax} width={60} onChange={v=>draftUpdate({distCmapMax:v})}/>
+                        <Typography fontSize={10} color="text.secondary">% (auto if blank)</Typography>
+                      </Box>
+                    </Box>
+                  </>
+                )}
               </Box>
             </Box>
 
@@ -1051,11 +1798,170 @@ function DisplayItemPanel({
                 ))}
               </Box>
             )}
+
+            {/* Percentile filter (rolling window) */}
+            {draft.chartMode==="2d" && availHeaders.length>0 && (
+              <Box>
+                <FormControlLabel
+                  control={<Checkbox size="small" sx={{ py:0.1 }} checked={draft.pfEnabled??false}
+                    onChange={e=>draftUpdate({pfEnabled:e.target.checked})}/>}
+                  label={<Typography fontSize={12}>Percentile filter (rolling window)</Typography>}
+                />
+                {draft.pfEnabled && (
+                  <Box sx={{ pl:1, display:"flex", flexDirection:"column", gap:1, mt:0.5 }}>
+                    {/* Window size and percentile */}
+                    <Box sx={{ display:"flex", gap:1, flexWrap:"wrap", alignItems:"center" }}>
+                      <Typography fontSize={11} color="text.secondary">Window</Typography>
+                      <NumInput value={draft.pfWindowN??"11"} width={50} placeholder="11"
+                        onChange={v=>{ const n=parseInt(v,10)||11; draftUpdate({pfWindowN:String(n%2===0?n+1:n)}); }}/>
+                      <Typography fontSize={11} color="text.secondary">pt (odd)</Typography>
+                      <Typography fontSize={11} color="text.secondary" sx={{ ml:1 }}>Percentile</Typography>
+                      <NumInput value={draft.pfPercent??"50"} width={46} placeholder="50" onChange={v=>draftUpdate({pfPercent:v})}/>
+                      <Typography fontSize={11} color="text.secondary">%</Typography>
+                    </Box>
+                    {/* Filtered series list */}
+                    {(draft.pfSeries??[]).map((pf, pi)=>(
+                      <Box key={pf.id} sx={{ display:"flex", gap:0.8, alignItems:"center", flexWrap:"wrap",
+                        pl:0.5, borderLeft:"3px solid", borderColor:pf.color, py:0.4, pr:0.5,
+                        bgcolor:"grey.50", borderRadius:"0 4px 4px 0",
+                        opacity: pf.hidden ? 0.45 : 1 }}>
+                        <IconButton size="small" sx={{ p:0.2 }}
+                          onClick={()=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,hidden:!pf.hidden}; draftUpdate({pfSeries:ns}); onUpdate({pfSeries:ns}); }}>
+                          {pf.hidden
+                            ?<VisibilityOffIcon sx={{fontSize:13,color:"text.disabled"}}/>
+                            :<VisibilityIcon sx={{fontSize:13,color:"primary.main"}}/>}
+                        </IconButton>
+                        <FormControl size="small" sx={{ minWidth:110 }}>
+                          <InputLabel sx={{ fontSize:11 }}>Y col</InputLabel>
+                          <Select label="Y col" value={pf.yCol}
+                            onChange={e=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,yCol:e.target.value}; draftUpdate({pfSeries:ns}); }}
+                            sx={{ fontSize:11 }}>
+                            {availHeaders.map(h=><MenuItem key={h} value={h} sx={{fontSize:11}}>{h}</MenuItem>)}
+                            {pi>0 && (draft.pfSeries??[]).slice(0,pi).map(prev=>(
+                              <MenuItem key={prev.id} value={prev.id} sx={{fontSize:11,color:"primary.main"}}>
+                                {prev.label||`${prev.yCol}_pf`} (PF)
+                              </MenuItem>
+                            ))}
+                          </Select>
+                        </FormControl>
+                        <TextField size="small" placeholder={pf.yCol?`${pf.yCol}_pf`:"label"} value={pf.label}
+                          onChange={e=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,label:e.target.value}; draftUpdate({pfSeries:ns}); }}
+                          inputProps={{ style:{fontSize:11,width:100} }} sx={{ width:122 }}/>
+                        <ColorInput value={pf.color}
+                          onChange={c=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,color:c}; draftUpdate({pfSeries:ns}); }}/>
+                        <TextField size="small" type="number" value={pf.strokeWidth}
+                          onChange={e=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,strokeWidth:parseFloat(e.target.value)||1}; draftUpdate({pfSeries:ns}); }}
+                          inputProps={{ style:{fontSize:11,width:30} }} sx={{ width:52 }}/>
+                        <Select size="small" value={pf.dashArray}
+                          onChange={e=>{ const ns=[...(draft.pfSeries??[])]; ns[pi]={...pf,dashArray:e.target.value}; draftUpdate({pfSeries:ns}); }}
+                          sx={{ fontSize:11, minWidth:72 }}>
+                          {DASH_OPTIONS.map(o=><MenuItem key={o.value} value={o.value} title={o.title} sx={{fontSize:12}}>{o.label}</MenuItem>)}
+                        </Select>
+                        <IconButton size="small" color="error"
+                          onClick={()=>draftUpdate({pfSeries:(draft.pfSeries??[]).filter((_,k)=>k!==pi)})}>
+                          <DeleteIcon fontSize="small"/>
+                        </IconButton>
+                      </Box>
+                    ))}
+                    <Button size="small" startIcon={<AddIcon/>} variant="outlined" sx={{ alignSelf:"flex-start", fontSize:11 }}
+                      onClick={()=>{
+                        const newPf: PfSeriesConfig = {
+                          id: crypto.randomUUID(),
+                          yCol: availHeaders[0]??"",
+                          label: "",
+                          color: PALETTE[(draft.pfSeries??[]).length % PALETTE.length],
+                          strokeWidth: 2,
+                          dashArray: "6 3",
+                        };
+                        draftUpdate({pfSeries:[...(draft.pfSeries??[]), newPf]});
+                      }}>
+                      Add filtered series
+                    </Button>
+                  </Box>
+                )}
+              </Box>
+            )}
+
+            {/* X-range averages (multiple) */}
+            {draft.chartMode==="2d" && effectiveX && effectiveY.length>0 && (
+              <Box>
+                <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
+                  <Typography fontSize={12} fontWeight={500}>X-range averages</Typography>
+                  <IconButton size="small" color="primary"
+                    onClick={()=>{
+                      const newAr: AvgRangeConfig = { id: crypto.randomUUID(), xMin:"", xMax:"", yCols:[], label:"" };
+                      draftUpdate({ avgRanges: [...(draft.avgRanges??[]), newAr] });
+                    }}>
+                    <AddIcon fontSize="small"/>
+                  </IconButton>
+                </Box>
+                {(draft.avgRanges??[]).map((ar, ai)=>{
+                  const arAvg = avgValues.filter(v=>v.rangeId===ar.id);
+                  return (
+                    <Box key={ar.id} sx={{ mt:0.5, pl:1, borderLeft:"3px solid", borderColor:"info.main",
+                      bgcolor:"grey.50", borderRadius:"0 4px 4px 0", py:0.5, pr:0.5,
+                      display:"flex", flexDirection:"column", gap:0.5 }}>
+                      {/* Row 1: label + x range + delete */}
+                      <Box sx={{ display:"flex", gap:0.5, alignItems:"center", flexWrap:"wrap" }}>
+                        <TextField size="small" placeholder="label" value={ar.label}
+                          onChange={e=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,label:e.target.value}; draftUpdate({avgRanges:n}); }}
+                          inputProps={{ style:{fontSize:11,width:80} }} sx={{ width:100 }}/>
+                        <Typography fontSize={11} color="text.secondary">X:</Typography>
+                        <NumInput value={ar.xMin} width={60} placeholder="min"
+                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMin:v}; draftUpdate({avgRanges:n}); }}/>
+                        <Typography fontSize={11}>～</Typography>
+                        <NumInput value={ar.xMax} width={60} placeholder="max"
+                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMax:v}; draftUpdate({avgRanges:n}); }}/>
+                        <IconButton size="small" color="error"
+                          onClick={()=>draftUpdate({avgRanges:(draft.avgRanges??[]).filter((_,k)=>k!==ai)})}>
+                          <DeleteIcon fontSize="small"/>
+                        </IconButton>
+                      </Box>
+                      {/* Row 2: Y cols selector (empty = all) */}
+                      <Box sx={{ display:"flex", gap:0.3, flexWrap:"wrap", alignItems:"center" }}>
+                        <Typography fontSize={10} color="text.secondary" sx={{ mr:0.2 }}>Y (empty=all):</Typography>
+                        {effectiveY.map(col=>(
+                          <FormControlLabel key={col}
+                            control={<Checkbox size="small" sx={{ py:0.1 }} checked={ar.yCols.includes(col)}
+                              onChange={e=>{
+                                const nc = e.target.checked ? [...ar.yCols,col] : ar.yCols.filter(c=>c!==col);
+                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n});
+                              }}/>}
+                            label={<Typography fontSize={10}>{col}</Typography>} sx={{ mr:0.3 }}
+                          />
+                        ))}
+                        {draft.pfEnabled && (draft.pfSeries??[]).map(pf=>(
+                          <FormControlLabel key={pf.id}
+                            control={<Checkbox size="small" sx={{ py:0.1 }} checked={ar.yCols.includes(pf.id)}
+                              onChange={e=>{
+                                const nc = e.target.checked ? [...ar.yCols,pf.id] : ar.yCols.filter(c=>c!==pf.id);
+                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n});
+                              }}/>}
+                            label={<Typography fontSize={10} sx={{color:"primary.main"}}>{pf.label||`${pf.yCol}_pf`}</Typography>} sx={{ mr:0.3 }}
+                          />
+                        ))}
+                      </Box>
+                      {/* Row 3: computed avg chips */}
+                      {arAvg.length>0 && (
+                        <Box sx={{ display:"flex", gap:0.5, flexWrap:"wrap" }}>
+                          {arAvg.map(({col,colLabel,val,color})=>(
+                            <Chip key={col} size="small"
+                              label={`${ar.label?ar.label+" ":""}avg ${colLabel}: ${val.toFixed(4)}`}
+                              sx={{ fontSize:10, bgcolor:color+"22", borderColor:color, border:"1px solid" }}
+                            />
+                          ))}
+                        </Box>
+                      )}
+                    </Box>
+                  );
+                })}
+              </Box>
+            )}
           </Box>
         </Collapse>
 
         {/* ── Chart area ── */}
-        <Box sx={{ p:1 }}>
+        <Box ref={chartAreaRef} sx={{ p:1 }}>
           {!draft.pathCol ? (
             <Hint>[\u2261] Open Edit \u2192 select a file path column</Hint>
           ) : !selectedEntry ? (
@@ -1075,11 +1981,11 @@ function DisplayItemPanel({
               <Box sx={{ bgcolor:draft.chartBgColor, borderRadius:1, p:1, overflow:"hidden", display:"flex", gap:0.5 }}>
                 <Box sx={{ flexGrow:1, minWidth:0 }}>
                 <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
-                  <LineChart data={chartData2D} margin={{ top:5, right:20, bottom:24, left:10 }}>
+                  <LineChart data={chartData2D} margin={{ top:5, right:20, bottom:32, left:10 }}>
                     <CartesianGrid strokeDasharray="3 3" opacity={0.25}/>
                     <XAxis dataKey={effectiveX} tickFormatter={xTickFmt} tick={{ fontSize:10 }}
                       domain={xDomain} allowDataOverflow={!!xDomain}
-                      label={{ value:draft.xLabel||effectiveX, position:"insideBottom", offset:-12, fontSize:11 }}
+                      label={{ value:draft.xLabel||effectiveX, position:"insideBottom", offset:-16, fontSize:11 }}
                     />
                     <YAxis tick={{ fontSize:10 }} width={draft.yLabel?72:52}
                       domain={yDomain} allowDataOverflow={!!yDomain}
@@ -1088,21 +1994,67 @@ function DisplayItemPanel({
                     <ChartTooltip contentStyle={{ fontSize:11 }}
                       formatter={(v:number)=>[typeof v==="number"?v.toFixed(4):v,""]}
                     />
-                    {draft.showLegend !== false && <Legend wrapperStyle={{ fontSize:11 }}/>}
-                    {effectiveY.map((col,i)=>{
-                      const s=getSeriesStyle(draft.seriesStyles,col,i);
-                      const t=draft.seriesTypes[col]??"line";
-                      const Dot=dotRenderers[col];
+                    {draft.showLegend !== false && <Legend verticalAlign="top" height={26} wrapperStyle={{ fontSize:11 }}/>}
+                    {/* X range colored backgrounds — behind everything */}
+                    {(draft.avgRanges??[]).map((ar)=>{
+                      const x1=parseNum(ar.xMin??"");
+                      const x2=parseNum(ar.xMax??"");
+                      if (x1===undefined&&x2===undefined) return null;
+                      const rangeAvgVals=avgValues.filter(v=>v.rangeId===ar.id);
+                      const rangeColor=rangeAvgVals[0]?.color??"#888";
                       return (
-                        <Line key={col} type="monotone" dataKey={col}
-                          stroke={s.useColormap&&t==="scatter"?"transparent":s.color}
-                          strokeWidth={t==="scatter"?0:s.strokeWidth}
-                          strokeDasharray={t==="scatter"?undefined:(s.dashArray||undefined)}
-                          dot={t==="scatter"&&Dot?(Dot as any):false}
-                          activeDot={t==="scatter"?false:{ r:3, fill:s.color }}
-                          isAnimationActive={false}
+                        <ReferenceArea key={`bg-${ar.id}`}
+                          x1={x1} x2={x2}
+                          fill={rangeColor} fillOpacity={0.10}
+                          stroke={rangeColor} strokeOpacity={0.4} strokeWidth={1} strokeDasharray="4 3"
+                          label={(lp: any)=>{
+                            const vb=lp?.viewBox; if(!vb) return null;
+                            const cx=vb.x+vb.width/2;
+                            return (
+                              <g>
+                                {rangeAvgVals.map((item,i)=>(
+                                  <text key={item.col} x={cx} y={vb.y+11+i*12}
+                                    textAnchor="middle" fontSize={9} fill={item.color}
+                                    fontWeight={600} style={{pointerEvents:"none"}}>
+                                    {`${item.colLabel}: ${item.val.toFixed(4)}`}
+                                  </text>
+                                ))}
+                              </g>
+                            );
+                          }}
                         />
                       );
+                    })}
+                    {settingsSeriesOrder.map(id=>{
+                      if (draft.yCols.includes(id)) {
+                        if (!availHeaders.includes(id)||(draft.hiddenYCols??[]).includes(id)) return null;
+                        const i=draft.yCols.indexOf(id);
+                        const s=getSeriesStyle(draft.seriesStyles,id,i);
+                        const t=draft.seriesTypes[id]??"line";
+                        const Dot=dotRenderers[id];
+                        return (
+                          <Line key={id} type="monotone" dataKey={id} name={id}
+                            stroke={s.useColormap&&t==="scatter"?"transparent":s.color}
+                            strokeWidth={t==="scatter"?0:s.strokeWidth}
+                            strokeDasharray={t==="scatter"?undefined:(s.dashArray||undefined)}
+                            dot={t==="scatter"&&Dot?(Dot as any):false}
+                            activeDot={t==="scatter"?false:{ r:3, fill:s.color }}
+                            isAnimationActive={false}
+                          />
+                        );
+                      } else {
+                        const pf=(draft.pfSeries??[]).find(p=>p.id===id);
+                        if (!pf||!draft.pfEnabled||pf.hidden) return null;
+                        return (
+                          <Line key={`pf-${pf.id}`} type="monotone" dataKey={pf.id}
+                            name={pf.label||`${pf.yCol}_pf`}
+                            stroke={pf.color} strokeWidth={pf.strokeWidth||2}
+                            strokeDasharray={pf.dashArray||undefined}
+                            dot={false} activeDot={{ r:3, fill:pf.color }}
+                            isAnimationActive={false} connectNulls
+                          />
+                        );
+                      }
                     })}
                   </LineChart>
                 </ResponsiveContainer>
@@ -1126,6 +2078,21 @@ function DisplayItemPanel({
                 })}
               </Box>
             )
+          ) : draft.chartMode==="dist" ? (
+            !readyDist ? <Hint>[\u2261] Select X and Y columns</Hint>
+            : !distData ? <Hint>No data in range</Hint>
+            : (
+              <Box sx={{ bgcolor:draft.chartBgColor, borderRadius:1, overflow:"hidden" }}>
+                <DistHeatmap
+                  pct={distData.pct}
+                  xMin={distData.xMin} xMax={distData.xMax} xStep={distData.xStep} xNum={distData.xNum}
+                  yMin={distData.yMin} yMax={distData.yMax} yStep={distData.yStep} yNum={distData.yNum}
+                  xLabel={draft.xLabel||distData.xCol} yLabel={draft.yLabel||distData.yCol}
+                  maxPct={distData.maxPct} bgColor={draft.chartBgColor}
+                  cmapMin={parseNum(draft.distCmapMin)} cmapMax={parseNum(draft.distCmapMax)}
+                />
+              </Box>
+            )
           ) : (
             !ready3D ? <Hint>[\u2261] Select X, Y, Z columns</Hint>
             : !rows?.length ? <Hint>No data</Hint>
@@ -1143,6 +2110,150 @@ function DisplayItemPanel({
         </Box>
       </Collapse>
     </Paper>
+  );
+}
+
+// ── DistHeatmap ───────────────────────────────────────────────────────────────
+const INFERNO_STOPS: [number, [number,number,number]][] = [
+  [0.00, [  0,   0,   4]],
+  [0.20, [ 40,  11,  84]],
+  [0.40, [101,  21, 110]],
+  [0.60, [167,  54,  72]],
+  [0.80, [224, 120,  18]],
+  [1.00, [252, 255, 164]],
+];
+
+function infernoColor(t: number): string {
+  const s = INFERNO_STOPS;
+  for (let i=1; i<s.length; i++) {
+    if (t <= s[i][0]) {
+      const [t0,c0] = s[i-1], [t1,c1] = s[i];
+      const f = (t-t0)/(t1-t0);
+      const r = Math.round(c0[0]+f*(c1[0]-c0[0]));
+      const g = Math.round(c0[1]+f*(c1[1]-c0[1]));
+      const b = Math.round(c0[2]+f*(c1[2]-c0[2]));
+      return `rgb(${r},${g},${b})`;
+    }
+  }
+  return `rgb(252,255,164)`;
+}
+
+interface DistHeatmapProps {
+  pct: number[][];
+  xMin: number; xMax: number; xStep: number; xNum: number;
+  yMin: number; yMax: number; yStep: number; yNum: number;
+  xLabel: string; yLabel: string;
+  maxPct: number; bgColor: string;
+  cmapMin?: number; cmapMax?: number;
+}
+
+function DistHeatmap({ pct, xMin, xMax: _xMax, xStep, xNum, yMin, yMax: _yMax, yStep, yNum, xLabel, yLabel, maxPct, bgColor, cmapMin, cmapMax }: DistHeatmapProps) {
+  const svgH = CHART_HEIGHT;
+  const mt = 12, mb = 68;
+  const cMin = cmapMin ?? 0;
+  const cMax = cmapMax ?? maxPct;
+
+  // Colorbar gradient stops: top=max(yellow), bottom=min(black)
+  const gradStops = INFERNO_STOPS.slice().reverse().map(([t,]) => `${infernoColor(t)} ${Math.round((1-t)*100)}%`).join(",");
+
+  // X axis ticks (up to 8)
+  const xTickCount = Math.min(xNum, 8);
+  const xTicks = Array.from({length: xTickCount+1}, (_,i) => {
+    const idx = Math.round(i * (xNum / xTickCount));
+    return { idx: Math.min(idx, xNum), val: xMin + Math.min(idx, xNum) * xStep };
+  });
+
+  // Y axis ticks (up to 8)
+  const yTickCount = Math.min(yNum, 8);
+  const yTicks = Array.from({length: yTickCount+1}, (_,i) => {
+    const idx = Math.round(i * (yNum / yTickCount));
+    return { idx: Math.min(idx, yNum), val: yMin + Math.min(idx, yNum) * yStep };
+  });
+
+  const fmtVal = (v: number) => {
+    if (Math.abs(v) >= 10000) return `${(v/1000).toFixed(1)}k`;
+    if (Math.abs(v) >= 100) return v.toFixed(0);
+    if (Math.abs(v) >= 1) return v.toFixed(2);
+    return v.toFixed(3);
+  };
+
+  return (
+    <Box sx={{ width:"100%", height:svgH, display:"flex", flexDirection:"column", bgcolor:bgColor, userSelect:"none" }}>
+      {/* Main layout: Y-label | Y-ticks | grid | colorbar */}
+      <Box sx={{ display:"flex", flex:1, minHeight:0, mt:`${mt}px`, mb:`${mb}px` }}>
+        {/* Y axis label (rotated) */}
+        <Box sx={{ width:18, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <Typography fontSize={11} color="text.secondary"
+            sx={{ transform:"rotate(-90deg)", whiteSpace:"nowrap", transformOrigin:"center" }}>
+            {yLabel}
+          </Typography>
+        </Box>
+        {/* Y axis ticks */}
+        <Box sx={{ width:44, position:"relative", height:"100%" }}>
+          {yTicks.map(({idx, val}) => (
+            <Typography key={idx} fontSize={9} color="text.secondary"
+              sx={{ position:"absolute", right:4, top:`${(idx/yNum)*100}%`,
+                transform:"translateY(-50%)", whiteSpace:"nowrap", textAlign:"right" }}>
+              {fmtVal(val)}
+            </Typography>
+          ))}
+        </Box>
+        {/* Heatmap grid */}
+        <Box sx={{ flex:1, minWidth:0, position:"relative", height:"100%" }}>
+          <Box sx={{
+            position:"absolute", inset:0,
+            display:"grid",
+            gridTemplateRows:`repeat(${yNum},1fr)`,
+            gridTemplateColumns:`repeat(${xNum},1fr)`,
+          }}>
+            {pct.map((row, yi) => row.map((val, xi) => {
+              const t = cMax > cMin ? Math.max(0, Math.min(1, (val - cMin) / (cMax - cMin))) : 0;
+              return (
+                <Box key={`${yi}-${xi}`}
+                  title={`x=${fmtVal(xMin+xi*xStep)}~${fmtVal(xMin+(xi+1)*xStep)}, y=${fmtVal(yMin+yi*yStep)}~${fmtVal(yMin+(yi+1)*yStep)}: ${val.toFixed(3)}%`}
+                  sx={{ bgcolor: infernoColor(t) }}
+                />
+              );
+            }))}
+          </Box>
+          {/* X axis ticks — rotated 45° to prevent overlap */}
+          <Box sx={{ position:"absolute", bottom:`-${mb}px`, left:0, right:0, height:`${mb}px`, overflow:"visible" }}>
+            {xTicks.map(({idx, val}) => (
+              <Typography key={idx} fontSize={9} color="text.secondary"
+                sx={{
+                  position:"absolute",
+                  left:`${(idx/xNum)*100}%`,
+                  top:4,
+                  transform:"rotate(45deg)",
+                  transformOrigin:"left top",
+                  whiteSpace:"nowrap",
+                }}>
+                {fmtVal(val)}
+              </Typography>
+            ))}
+            {/* X axis label */}
+            <Typography fontSize={11} color="text.secondary"
+              sx={{ position:"absolute", bottom:2, left:"50%", transform:"translateX(-50%)", whiteSpace:"nowrap" }}>
+              {xLabel}
+            </Typography>
+          </Box>
+        </Box>
+        {/* Colorbar */}
+        <Box sx={{ width:20, ml:1, position:"relative", height:"100%",
+          background:`linear-gradient(to bottom, ${gradStops})`,
+          border:"1px solid rgba(128,128,128,0.3)", borderRadius:0.5 }}
+        />
+        {/* Colorbar labels */}
+        <Box sx={{ width:52, position:"relative", height:"100%", pl:0.5 }}>
+          {[0,0.25,0.5,0.75,1].map(t => (
+            <Typography key={t} fontSize={9} color="text.secondary"
+              sx={{ position:"absolute", top:`${t*100}%`, transform:"translateY(-50%)", whiteSpace:"nowrap" }}>
+              {(cMin + (cMax - cMin)*(1-t)).toFixed(2)}%
+            </Typography>
+          ))}
+        </Box>
+      </Box>
+    </Box>
   );
 }
 

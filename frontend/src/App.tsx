@@ -1,10 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AppBar, Box, Button, CssBaseline, Dialog, DialogActions, DialogContent,
-  DialogTitle, IconButton, Tab, Tabs, TextField, Toolbar, Tooltip, Typography,
+  DialogTitle, IconButton, Tab, Tabs, TextField, Toolbar, Typography,
   createTheme, ThemeProvider,
 } from "@mui/material";
-import SmartToyIcon from "@mui/icons-material/SmartToy";
 import ScienceIcon from "@mui/icons-material/Science";
 import UndoIcon from "@mui/icons-material/Undo";
 import AccountCircleIcon from "@mui/icons-material/AccountCircle";
@@ -15,9 +14,9 @@ import MasterPage from "./pages/MasterPage";
 import IoPage from "./pages/IoPage";
 import SettingsPage from "./pages/SettingsPage";
 import DocumentsPage from "./pages/DocumentsPage";
-import ChatbotDialog from "./components/chat/ChatbotDialog";
 import { settingsApi } from "./api/settings";
 import { UndoProvider, useUndo } from "./context/UndoContext";
+import { OctProvider, useOct } from "./context/OctContext";
 
 const MAIN_TABS = ["New Project", "Experiments", "Masters", "Import / Export", "Settings", "Documents"];
 
@@ -28,8 +27,8 @@ function AppContent() {
   const [showLoginDialog, setShowLoginDialog] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
   const [passwordError, setPasswordError] = useState(false);
-  const [showChatbot, setShowChatbot] = useState(false);
   const { canUndo, undoLabel, executeUndo } = useUndo();
+  const { isOctWaiting } = useOct();
   const isAdmin = role === "administrator";
 
   useEffect(() => {
@@ -61,14 +60,14 @@ function AppContent() {
     createTheme({
       palette: {
         mode: darkMode ? "dark" : "light",
-        primary: { main: isAdmin ? "#c62828" : (darkMode ? "#90caf9" : "#1976d2") },
+        primary: { main: isOctWaiting ? "#7b1fa2" : isAdmin ? "#c62828" : "#1565c0" },
         ...(darkMode ? {
           secondary: { main: "#ce93d8" },
           background: { default: "#121212", paper: "#1e1e1e" },
         } : {}),
       },
     }),
-  [darkMode, isAdmin]);
+  [darkMode, isAdmin, isOctWaiting]);
 
   const handleToggleDark = (val: boolean) => {
     setDarkMode(val);
@@ -85,11 +84,6 @@ function AppContent() {
             <Typography variant="h6" sx={{ flexGrow: 1 }}>
               Laser Experiment Database
             </Typography>
-            <Tooltip title="AI Database Assistant">
-              <IconButton color="inherit" onClick={() => setShowChatbot(true)} sx={{ ml: 0.5 }}>
-                <SmartToyIcon />
-              </IconButton>
-            </Tooltip>
             {canUndo && (
               <Button
                 color="error"
@@ -152,7 +146,6 @@ function AppContent() {
             <Button onClick={handleLoginSubmit} variant="contained">Login</Button>
           </DialogActions>
         </Dialog>
-        <ChatbotDialog open={showChatbot} onClose={() => setShowChatbot(false)} />
       </Box>
     </ThemeProvider>
   );
@@ -161,7 +154,9 @@ function AppContent() {
 function App() {
   return (
     <UndoProvider>
-      <AppContent />
+      <OctProvider>
+        <AppContent />
+      </OctProvider>
     </UndoProvider>
   );
 }

@@ -137,6 +137,12 @@ def _project_session(project_id: str) -> Session:
         if "remarks" not in proj_cols:
             conn.execute(text("ALTER TABLE project ADD COLUMN remarks TEXT"))
             conn.commit()
+        # Add new result columns if missing
+        result_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(result)"))}
+        for col, col_type in [("gap_opening_mm", "REAL"), ("dissimilar_material_flag", "INTEGER")]:
+            if col not in result_cols:
+                conn.execute(text(f"ALTER TABLE result ADD COLUMN {col} {col_type}"))
+                conn.commit()
         # Sync custom columns from main DB's column_defs
         try:
             from backend.database import _migrate_experiment_custom_cols, SessionLocal as _MainSession
@@ -534,9 +540,17 @@ def merge_project(project_id: str, body: dict = Body(default={})):
             src_rows = [dict(r) for r in src_cur.fetchall()]
             inserted = skipped = updated = 0
             col_names = {c.name for c in model.__table__.columns}
+            # Build composite PK tuple if the model has multiple PK columns
+            pk_cols = [c.name for c in model.__table__.columns if c.primary_key]
             for row in src_rows:
                 pk_val = row.get(pk_field)
-                existing = main_db.get(model, str(pk_val)) if pk_val else None
+                if not pk_val:
+                    existing = None
+                elif len(pk_cols) > 1:
+                    pk_tuple = tuple(row.get(c) for c in pk_cols)
+                    existing = main_db.get(model, pk_tuple)
+                else:
+                    existing = main_db.get(model, str(pk_val))
                 if existing:
                     # Overwrite only if explicitly requested (experiment table only)
                     if model is Experiment and str(pk_val) in overwrite_ids:
@@ -822,9 +836,17 @@ def _collect_report_sections(project_id: str):
         def fetch(model, pk_val):
             if not pk_val:
                 return None
-            obj = proj_db2.get(model, pk_val)
-            if obj is None:
-                obj = main_db.get(model, pk_val)
+            pk_cols = list(model.__table__.primary_key.columns)
+            if len(pk_cols) == 1:
+                obj = proj_db2.get(model, pk_val)
+                if obj is None:
+                    obj = main_db.get(model, pk_val)
+            else:
+                # Composite PK: filter by first PK column
+                id_col = getattr(model, pk_cols[0].name)
+                obj = proj_db2.query(model).filter(id_col == pk_val).first()
+                if obj is None:
+                    obj = main_db.query(model).filter(id_col == pk_val).first()
             return {c.name: getattr(obj, c.name) for c in obj.__table__.columns} if obj else None
 
         def fetch_laser_beams(lb_id):
@@ -1032,7 +1054,7 @@ def export_project_report_md(project_id: str):
 
     exp_rows, all_sections = _collect_report_sections(project_id)
     n = len(exp_rows)
-    exp_labels = [f"No. {i}" for i in range(1, n + 1)]
+    exp_labels = [exp.get("experiment_id", f"No.{i}") for i, exp in enumerate(exp_rows, 1)]
 
     def _wide_tables(sec_exps: list) -> tuple:
         """Return (common_md, varying_md) for a section, respecting hidden_set."""
@@ -1061,12 +1083,12 @@ def export_project_report_md(project_id: str):
 
         varying_md = ""
         if varying_keys:
-            header = "| Parameter | " + " | ".join(exp_labels) + " |"
-            sep = "|---|" + "---|" * n
+            header = "| Experiment ID | " + " | ".join(varying_keys) + " |"
+            sep = "|---|" + "---|" * len(varying_keys)
             rows = [header, sep]
-            for k in varying_keys:
-                cells = " | ".join(_v(d.get(k)) for d in sec_exps)
-                rows.append(f"| {k} | {cells} |")
+            for label, d in zip(exp_labels, sec_exps):
+                cells = " | ".join(_v(d.get(k)) for k in varying_keys)
+                rows.append(f"| {label} | {cells} |")
             varying_md = "\n".join(rows) + "\n"
 
         return common_md, varying_md
@@ -1079,11 +1101,12 @@ def export_project_report_md(project_id: str):
 
     # Experiment overview
     lines.append("## 実験一覧\n")
-    lines.append("| No. | Remarks |")
+    lines.append("| Experiment ID | Remarks |")
     lines.append("|---|---|")
-    for i, exp in enumerate(exp_rows, 1):
+    for exp in exp_rows:
+        exp_id = exp.get("experiment_id") or "—"
         remarks = exp.get("remarks") or "—"
-        lines.append(f"| {i} | {remarks} |")
+        lines.append(f"| {exp_id} | {remarks} |")
     lines.append("\n---\n")
 
     # One section block per section

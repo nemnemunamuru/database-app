@@ -323,11 +323,13 @@ async function buildResultTree(item: any): Promise<TItem[]> {
     { label: "spatter_flag",           value: f(item.spatter_flag) },
     { label: "spatter_severity",       value: f(item.spatter_severity) },
     { label: "gap_opening_flag",       value: f(item.gap_opening_flag) },
+    { label: "gap_opening_mm",         value: f(item.gap_opening_mm, " mm") },
     { label: "crack_flag",             value: f(item.crack_flag) },
     { label: "crack_severity",         value: f(item.crack_severity) },
     { label: "glass_contamination",    value: f(item.glass_contamination) },
     { label: "surface_contamination",  value: f(item.surface_contamination) },
     { label: "penetration_flag",       value: f(item.penetration_flag) },
+    { label: "dissimilar_material_flag", value: f(item.dissimilar_material_flag) },
     { label: "remarks",                value: f(item.remarks) },
   ];
 }
@@ -609,11 +611,13 @@ const RESULT_FIELDS: FieldDef[] = [
   { key: "spatter_flag",             label: "spatter_flag",             type: "boolean" },
   { key: "spatter_severity",         label: "spatter_severity",         type: "number" },
   { key: "gap_opening_flag",         label: "gap_opening_flag",         type: "boolean" },
+  { key: "gap_opening_mm",           label: "gap_opening_mm",           type: "number" },
   { key: "crack_flag",               label: "crack_flag",               type: "boolean" },
   { key: "crack_severity",           label: "crack_severity",           type: "number" },
   { key: "glass_contamination",      label: "glass_contamination",      type: "boolean" },
   { key: "surface_contamination",    label: "surface_contamination",    type: "boolean" },
   { key: "penetration_flag",         label: "penetration_flag",         type: "boolean" },
+  { key: "dissimilar_material_flag", label: "dissimilar_material_flag", type: "boolean" },
   { key: "remarks",                  label: "remarks",                  type: "text" },
 ];
 

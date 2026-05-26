@@ -8,6 +8,7 @@ import SmartToyIcon from "@mui/icons-material/SmartToy";
 import SendIcon from "@mui/icons-material/Send";
 import CloseIcon from "@mui/icons-material/Close";
 import StorageIcon from "@mui/icons-material/Storage";
+import PsychologyIcon from "@mui/icons-material/Psychology";
 import api from "../../api/client";
 
 // --- design tokens ---
@@ -52,6 +53,11 @@ interface DbOption {
   group: "EXPERIMENT" | "PROJECT";
 }
 
+interface ModelOption {
+  id: string;
+  label: string;
+}
+
 interface Message {
   role: "user" | "assistant";
   text: string;
@@ -62,11 +68,22 @@ interface Message {
 interface Props {
   open: boolean;
   onClose: () => void;
+  size?: "small" | "medium" | "large" | "xl";
 }
 
-export default function ChatbotDialog({ open, onClose }: Props) {
+const SIZE_MAP = {
+  small:  { width: 340, height: 460 },
+  medium: { width: 420, height: 540 },
+  large:  { width: 560, height: 680 },
+  xl:     { width: 700, height: 820 },
+} as const;
+
+export default function ChatbotDialog({ open, onClose, size = "medium" }: Props) {
+  const MAX_HISTORY = 20;
   const [databases, setDatabases] = useState<DbOption[]>([]);
   const [selectedDb, setSelectedDb] = useState<string>("");
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -80,6 +97,12 @@ export default function ChatbotDialog({ open, onClose }: Props) {
         if (!selectedDb && r.data.default) setSelectedDb(r.data.default);
       })
       .catch(() => {});
+    api.get<{ models: ModelOption[]; default: string }>("/api/chat/models")
+      .then(r => {
+        setModels(r.data.models);
+        if (!selectedModel && r.data.default) setSelectedModel(r.data.default);
+      })
+      .catch(() => {});
   }, [open]);
 
   useEffect(() => {
@@ -90,7 +113,9 @@ export default function ChatbotDialog({ open, onClose }: Props) {
     const q = input.trim();
     if (!q || loading) return;
     setInput("");
-    setMessages(prev => [...prev, { role: "user", text: q }]);
+    // Capture history before adding the new user message
+    const historySnapshot = messages.slice(-(MAX_HISTORY - 1));
+    setMessages(prev => [...prev, { role: "user", text: q }].slice(-MAX_HISTORY));
     setLoading(true);
     try {
       const res = await api.post<{
@@ -98,18 +123,23 @@ export default function ChatbotDialog({ open, onClose }: Props) {
         experiment_count: number | null;
         experiment_ids: string[];
         message: string;
-      }>("/api/chat/query", { question: q, db: selectedDb });
+      }>("/api/chat/query", {
+        question: q,
+        db: selectedDb,
+        model: selectedModel || undefined,
+        history: historySnapshot.map(m => ({ role: m.role, text: m.text })),
+      });
       setMessages(prev => [...prev, {
         role: "assistant",
         text: res.data.message,
         experimentCount: res.data.experiment_count,
         experimentIds: res.data.experiment_ids,
-      }]);
+      }].slice(-MAX_HISTORY));
     } catch {
       setMessages(prev => [...prev, {
         role: "assistant",
         text: "An error occurred. Please try again.",
-      }]);
+      }].slice(-MAX_HISTORY));
     } finally {
       setLoading(false);
     }
@@ -121,6 +151,8 @@ export default function ChatbotDialog({ open, onClose }: Props) {
 
   if (!open) return null;
 
+  const { width: dlgW, height: dlgH } = SIZE_MAP[size];
+
   return (
     <Draggable nodeRef={nodeRef as React.RefObject<HTMLElement>} handle=".drag-handle" bounds="body">
       <Paper
@@ -129,7 +161,7 @@ export default function ChatbotDialog({ open, onClose }: Props) {
         sx={{
           position: "fixed",
           bottom: 80, right: 24,
-          width: 420, height: 540,
+          width: dlgW, height: dlgH,
           display: "flex", flexDirection: "column",
           zIndex: 1300,
           borderRadius: "12px",
@@ -216,6 +248,47 @@ export default function ChatbotDialog({ open, onClose }: Props) {
             )}
             {projectDbs.map(db => (
               <MenuItem key={db.id} value={db.id}>{db.label}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </Box>
+
+      {/* Model selector */}
+      <Box sx={{
+        px: 2, py: 0.75, flexShrink: 0,
+        bgcolor: BG2,
+        borderBottom: `1px solid ${BORDER}`,
+        display: "flex", alignItems: "center", gap: 1,
+      }}>
+        <PsychologyIcon sx={{ fontSize: 14, color: TEXT_DIM }} />
+        <Typography sx={{ fontSize: 10, color: TEXT_DIM, fontFamily: "monospace", mr: 0.5, letterSpacing: 1 }}>MODEL</Typography>
+        <FormControl size="small" sx={{ flexGrow: 1 }}>
+          <Select
+            value={selectedModel}
+            onChange={e => setSelectedModel(e.target.value)}
+            displayEmpty
+            variant="outlined"
+            sx={{
+              fontSize: 11, fontFamily: "monospace", color: CYAN,
+              height: 28,
+              "& .MuiOutlinedInput-notchedOutline": { borderColor: BORDER },
+              "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: CYAN },
+              "&.Mui-focused .MuiOutlinedInput-notchedOutline": { borderColor: CYAN },
+              "& .MuiSvgIcon-root": { color: TEXT_DIM },
+              bgcolor: "rgba(0,212,255,0.04)",
+            }}
+            MenuProps={{
+              PaperProps: {
+                sx: {
+                  bgcolor: BG2, border: `1px solid ${BORDER}`,
+                  "& .MuiMenuItem-root": { fontSize: 12, fontFamily: "monospace", color: TEXT },
+                  "& .MuiMenuItem-root:hover": { bgcolor: CYAN_DIM, color: CYAN },
+                },
+              },
+            }}
+          >
+            {models.map(m => (
+              <MenuItem key={m.id} value={m.id}>{m.label}</MenuItem>
             ))}
           </Select>
         </FormControl>
