@@ -743,9 +743,11 @@ export default function MasterPage() {
   const [trajectoryTypeDefs, setTrajectoryTypeDefs] = useState<TrajectoryTypeDef[]>([]);
 
   useEffect(() => {
-    trajectoryTypeDefsApi.sync().then(() =>
-      trajectoryTypeDefsApi.list().then(r => setTrajectoryTypeDefs(r.data))
-    ).catch(() => trajectoryTypeDefsApi.list().then(r => setTrajectoryTypeDefs(r.data)).catch(() => {}));
+    trajectoryTypeDefsApi.sync()
+      .then(() => trajectoryTypeDefsApi.list())
+      .catch(() => trajectoryTypeDefsApi.list())
+      .then(r => setTrajectoryTypeDefs(Array.isArray(r.data) ? r.data : []))
+      .catch(() => {});
   }, []);
 
   // Stable references for candidatesTables arrays to prevent spurious useEffect re-runs

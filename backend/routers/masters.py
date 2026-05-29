@@ -726,6 +726,20 @@ def delete_experiment(item_id: str, db: Session = Depends(get_db)):
     _delete_one(Experiment, "experiment_id", item_id, db)
 
 
+# ── TrajectoryTypeDefs (stub: returns empty list) ──────────────────────────────────────────
+
+@router.get("/trajectory-type-defs")
+def list_trajectory_type_defs():
+    """動的トラジェクトリパラメータタブ定義の一覧（現在は未使用・空リストを返す）"""
+    return []
+
+
+@router.post("/trajectory-type-defs/sync")
+def sync_trajectory_type_defs():
+    """trajectory-type-defs の同期（スタブ）"""
+    return {"synced": 0}
+
+
 # ── ColumnDef ───────────────────────────────────────────────────────────────────────────────
 
 @router.get("/column-defs")

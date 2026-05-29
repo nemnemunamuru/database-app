@@ -8,12 +8,14 @@ import ScienceIcon from "@mui/icons-material/Science";
 import UndoIcon from "@mui/icons-material/Undo";
 import AccountCircleIcon from "@mui/icons-material/AccountCircle";
 import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
+import SmartToyIcon from "@mui/icons-material/SmartToy";
 import NewProjectPage from "./pages/NewProjectPage";
 import ExperimentPage from "./pages/ExperimentPage";
 import MasterPage from "./pages/MasterPage";
 import IoPage from "./pages/IoPage";
 import SettingsPage from "./pages/SettingsPage";
 import DocumentsPage from "./pages/DocumentsPage";
+import ChatbotDialog from "./components/chat/ChatbotDialog";
 import { settingsApi } from "./api/settings";
 import { UndoProvider, useUndo } from "./context/UndoContext";
 import { OctProvider, useOct } from "./context/OctContext";
@@ -27,6 +29,8 @@ function AppContent() {
   const [showLoginDialog, setShowLoginDialog] = useState(false);
   const [passwordInput, setPasswordInput] = useState("");
   const [passwordError, setPasswordError] = useState(false);
+  const [chatbotOpen, setChatbotOpen] = useState(false);
+  const [chatbotSize, setChatbotSize] = useState<"small" | "medium" | "large" | "xl">("medium");
   const { canUndo, undoLabel, executeUndo } = useUndo();
   const { isOctWaiting } = useOct();
   const isAdmin = role === "administrator";
@@ -98,6 +102,14 @@ function AppContent() {
             )}
             <IconButton
               color="inherit"
+              onClick={() => setChatbotOpen(o => !o)}
+              sx={{ ml: 0.5 }}
+              title="AI Chatbot"
+            >
+              <SmartToyIcon />
+            </IconButton>
+            <IconButton
+              color="inherit"
               onClick={handleRoleIconClick}
               sx={{ ml: 0.5 }}
               title={isAdmin ? "Administrator — click to switch to Operator" : "Operator — click to switch to Administrator"}
@@ -122,9 +134,11 @@ function AppContent() {
           {mainTab === 1 && <ExperimentPage />}
           {mainTab === 2 && <MasterPage />}
           {mainTab === 3 && <IoPage isAdmin={isAdmin} />}
-          {mainTab === 4 && <SettingsPage darkMode={darkMode} onToggleDark={handleToggleDark} isAdmin={isAdmin} />}
+          {mainTab === 4 && <SettingsPage darkMode={darkMode} onToggleDark={handleToggleDark} isAdmin={isAdmin} chatbotSize={chatbotSize} onChangeChatbotSize={setChatbotSize} />}
           {mainTab === 5 && <DocumentsPage darkMode={darkMode} />}
         </Box>
+
+        <ChatbotDialog open={chatbotOpen} onClose={() => setChatbotOpen(false)} size={chatbotSize} />
         <Dialog open={showLoginDialog} onClose={() => setShowLoginDialog(false)} maxWidth="xs" fullWidth>
           <DialogTitle>Administrator Login</DialogTitle>
           <DialogContent>

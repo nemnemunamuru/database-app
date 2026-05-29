@@ -1255,14 +1255,34 @@ function DisplayItemPanel({
   rows, isLoadingFile, hasError, saving, accentColor, onUpdate, onRemove, onSave, onRefresh,
   onMoveUp, onMoveDown, chartAreaRef,
 }: DisplayItemPanelProps) {
-  // Local draft  Eall edit-panel changes live here until Save
+  // Local draft -- all edit-panel changes live here until Save
   const [draft, setDraft] = useState<DisplayItem>(()=>({...item}));
-  // Sync draft when item identity changes (new chart panel) or editing/expanded toggled externally
+  // Sync draft when item identity changes (new chart panel)
   useEffect(()=>{ setDraft({...item}); }, [item.id]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(()=>{ setDraft(prev=>({...prev, editing:item.editing, expanded:item.expanded, visible:item.visible})); }, [item.editing, item.expanded, item.visible]);
+  // Full sync from item when edit panel opens, so draft reflects latest saved state
+  const prevEditingRef = useRef(item.editing);
+  useEffect(()=>{
+    if (item.editing && !prevEditingRef.current) { setDraft({...item}); }
+    else { setDraft(prev=>({...prev, editing:item.editing, expanded:item.expanded, visible:item.visible})); }
+    prevEditingRef.current = item.editing;
+  }, [item.editing, item.expanded, item.visible]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Convenience draft updater
   const draftUpdate = (patch: Partial<DisplayItem>) => setDraft(prev=>({...prev,...patch}));
+
+  // Auto-select X/Y columns when file first loads for an unconfigured panel
+  const onSaveRef = useRef(onSave);
+  useEffect(() => { onSaveRef.current = onSave; }, [onSave]);
+  const autoSelectedRef = useRef(false);
+  useEffect(() => {
+    if (availHeaders.length === 0) { autoSelectedRef.current = false; return; }
+    if (autoSelectedRef.current) return;
+    if (item.xCol || item.yCols.length > 0) return; // already configured
+    autoSelectedRef.current = true;
+    const xCol = availHeaders[0];
+    const yCols = availHeaders.slice(1);
+    onSaveRef.current({ xCol, yCols });
+  }, [availHeaders.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Local text field buffers (need intermediate state while typing)
   const [localDs, setLocalDs] = useState(draft.downsample);

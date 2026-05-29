@@ -113,4 +113,4 @@ export const exportExperimentsCsv = () =>
   api.get("/api/io/export/experiments/csv", { responseType: "blob" });
 
 export const getLogFile = (filename: string, ds: number) =>
-  api.get<{ headers: string[]; rows: any[][] }>(`/api/io/log-file/${encodeURIComponent(filename)}`, { params: { ds } });
+  api.get<{ headers: string[]; rows: Record<string, number>[] }>(`/api/io/log-file/${encodeURIComponent(filename)}`, { params: { ds } });

@@ -1,3 +1,4 @@
+import csv
 import io as io_module
 import json
 import os
@@ -338,3 +339,51 @@ async def merge_db(file: UploadFile = FastAPIFile(...), db: Session = Depends(ge
         "message": f"Merge complete — {total_inserted} rows added, {total_skipped} skipped",
         "details": results,
     }
+
+
+# ── Log/CSV file reader ────────────────────────────────────────────────────────
+_DATA_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "data"))
+
+@router.get("/log-file/{filename:path}")
+def read_log_file(filename: str, ds: int = 10):
+    """
+    Read a CSV/log file from the data/ directory and return headers + rows.
+    `ds` = downsample factor (return every ds-th row).
+    """
+    # Security: prevent path traversal
+    safe = os.path.normpath(os.path.join(_DATA_DIR, filename))
+    if not safe.startswith(_DATA_DIR):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not os.path.isfile(safe):
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+
+    headers: list[str] = []
+    rows: list[dict] = []
+    try:
+        for enc in ("utf-8-sig", "utf-8", "shift_jis", "cp932"):
+            try:
+                with open(safe, encoding=enc, newline="") as f:
+                    reader = csv.DictReader(f)
+                    headers = reader.fieldnames or []
+                    all_rows = list(reader)
+                break
+            except UnicodeDecodeError:
+                continue
+        ds = max(1, ds)
+        sampled = all_rows[::ds]
+        # Convert to dict[str, float], skip rows with non-numeric values
+        parsed_rows: list[dict] = []
+        for r in sampled:
+            row: dict = {}
+            for h in headers:
+                v = r.get(h, "")
+                try:
+                    row[h] = float(v)
+                except (ValueError, TypeError):
+                    row[h] = 0.0
+            parsed_rows.append(row)
+        rows = parsed_rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"headers": headers, "rows": rows}
