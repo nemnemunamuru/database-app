@@ -86,8 +86,12 @@ flowchart TD
 | WELDING | WELDING_CONDITION | UUID | 溶接パラメータ（出力・速度・フォーカス） |
 | WELDING | TRAJECTORY_SET | UUID | トラジェクトリセット |
 | WELDING | MAIN_TRAJECTORY | UUID | メイントラジェクトリ種別 |
+| WELDING | CIRCLE_PARAMETER | UUID | 円軌跡パラメータ |
 | WELDING | LINE_PARAMETER | UUID | ラインスキャンパラメータ |
+| WELDING | SPIRAL_PARAMETER | UUID | スパイラル軌跡パラメータ |
 | WELDING | SUB_TRAJECTORY | UUID | サブトラジェクトリ種別 |
+| WELDING | EIGHT_PARAMETER | UUID | 8字軌跡パラメータ |
+| WELDING | RASTER_PARAMETER | UUID | ラスター軌跡パラメータ |
 | WELDING | WOBBLING_PARAMETER | UUID | ウォブリングパラメータ |
 | MATERIAL | EXPERIMENT_MATERIAL | UUID | 実験に使用する材料セット |
 | MATERIAL | MATERIAL_STATE | UUID | 材料の形状・表面状態 |

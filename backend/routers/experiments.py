@@ -1,6 +1,9 @@
+import csv
+import io
 import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import case, text
 from sqlalchemy.orm import Session, joinedload
 from pydantic import BaseModel
@@ -179,6 +182,33 @@ def clone_experiment(experiment_id: str, db: Session = Depends(get_db)):
     result = _to_dict(new_exp)
     _add_custom_cols([result], [new_exp.experiment_id], db)
     return result
+
+
+_RESULT_NUMERIC_COLS = {"oct_depth_mm", "cross_section_depth_mm", "spatter_severity", "crack_severity"}
+
+@router.post("/{experiment_id}/write-result")
+def write_experiment_result(experiment_id: str, body: dict, db: Session = Depends(get_db)):
+    """Create-or-update the Result record for an experiment with given numeric fields."""
+    exp = db.get(Experiment, experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    safe = {k: float(v) for k, v in body.items() if k in _RESULT_NUMERIC_COLS and v is not None}
+    if not safe:
+        raise HTTPException(status_code=400, detail="No valid result fields provided")
+    if exp.result_id:
+        result = db.get(Result, exp.result_id)
+        if result:
+            for k, v in safe.items():
+                setattr(result, k, v)
+            db.commit()
+            db.refresh(result)
+            return {"result_id": result.result_id, **safe}
+    new_result = Result(result_id=str(uuid.uuid4()), **safe)
+    db.add(new_result)
+    exp.result_id = new_result.result_id
+    db.commit()
+    db.refresh(new_result)
+    return {"result_id": new_result.result_id, **safe}
 
 
 @router.get("/{experiment_id}/detail")
@@ -425,3 +455,99 @@ def _to_detail(exp: Experiment, db) -> dict:
         "observation": observation,
         "file": file_data,
     }
+
+
+def _flatten_export_value(prefix: str, value, out: dict[str, object]) -> None:
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            _flatten_export_value(next_prefix, nested, out)
+        return
+    if isinstance(value, list):
+        for idx, item in enumerate(value, 1):
+            next_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            _flatten_export_value(next_prefix, item, out)
+        return
+    out[prefix] = value
+
+
+def _build_export_row(exp: Experiment, db: Session) -> dict[str, object]:
+    row = _to_dict(exp)
+    _add_custom_cols([row], [exp.experiment_id], db)
+    detail = _to_detail(exp, db)
+    report_exists = bool(
+        exp.result_id or exp.observation_id or exp.file_id or
+        any(
+            value not in (None, "", [], {})
+            for value in detail.values()
+            if not isinstance(value, (dict, list))
+        )
+    )
+    row["report_exists"] = report_exists
+    flat: dict[str, object] = {}
+    for key, value in row.items():
+        if value is not None:
+            flat[key] = value
+    _flatten_export_value("", detail, flat)
+    return flat
+
+
+@router.get("/export/columns")
+def list_experiment_export_columns(project_id: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(Experiment)
+    if project_id:
+        query = query.filter(Experiment.project_id == project_id)
+    columns: list[str] = []
+    seen: set[str] = set()
+    for exp in query.all():
+        row = _build_export_row(exp, db)
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+    return {"columns": columns, "default_columns": columns}
+
+
+@router.get("/export/csv")
+def export_experiments_csv(
+    columns: Optional[str] = None,
+    project_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Experiment)
+    if project_id:
+        query = query.filter(Experiment.project_id == project_id)
+    rows = [_build_export_row(exp, db) for exp in query.order_by(Experiment.experiment_id).all()]
+
+    all_keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                all_keys.append(key)
+
+    selected = []
+    if columns:
+        selected = [c.strip() for c in columns.split(',') if c.strip()]
+    else:
+        selected = all_keys
+    selected = [c for c in selected if c in seen]
+    if not selected:
+        selected = all_keys
+
+    # Excel recognizes the BOM and opens UTF-8 CSV columns without import ambiguity.
+    output = io.StringIO()
+    output.write("\ufeff")
+    writer = csv.DictWriter(output, fieldnames=selected, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in selected})
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=experiments_export.csv"},
+    )

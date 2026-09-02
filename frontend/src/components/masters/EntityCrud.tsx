@@ -5,6 +5,7 @@ import {
   InputLabel, MenuItem, Paper, Select, Table, TableBody, TableCell,
   TableContainer, TableHead, TableRow, TextField, Tooltip, Typography,
 } from "@mui/material";
+import apiClient from "../../api/client";
 import { columnDefsTableApi } from "../../api/masters";
 import { IdPickerDialog } from "../common/IdPickerDialog";
 import { FK_CONFIG } from "../common/IdSelectField";
@@ -242,6 +243,10 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
   // candidates from column_defs: { columnName → Candidate[] }
   const [candidatesMap, setCandidatesMap] = useState<Record<string, Candidate[]>>({});
   const [orderMap, setOrderMap]           = useState<Record<string, number>>({});
+  const [formulaMap, setFormulaMap]       = useState<Record<string, string>>({});
+  const [formulaPick, setFormulaPick]     = useState<Record<string, string>>({});
+  const [formulaGlobalRefs, setFormulaGlobalRefs] = useState<string[]>([]);
+  const [formulaNumber, setFormulaNumber] = useState<Record<string, string>>({});
   const [fkPickerField, setFkPickerField] = useState<string | null>(null);
   // Extra fields discovered from column_def (not in the static fields prop)
   const [extraFields, setExtraFields]     = useState<FieldDef[]>([]);
@@ -259,6 +264,38 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
     }
     return 'text';
   };
+
+  const computeFormulaValue = (formula: string, values: Record<string, any>): number | undefined => {
+    try {
+      let expr = formula.replace(/π/g, "pi");
+      const refs = Array.from(new Set((expr.match(/[A-Za-z_][A-Za-z0-9_.]*/g) ?? [])));
+
+      const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      for (const ref of refs) {
+        if (ref === "sqrt" || ref.toLowerCase() === "pi") continue;
+        const raw = values[ref] ?? (ref.includes(".") ? values[ref.split(".").pop() ?? ""] : undefined);
+        const num = Number(raw);
+        const safeNum = Number.isFinite(num) ? num : 0;
+        expr = expr.replace(new RegExp(`(?<![A-Za-z0-9_.])${escRe(ref)}(?![A-Za-z0-9_.])`, "g"), `(${safeNum})`);
+      }
+
+      expr = expr.replace(/\bpi\b/gi, "Math.PI");
+      expr = expr.replace(/\bsqrt\s*\(/g, "Math.sqrt(");
+      const normalized = expr.replace(/\bMath\.sqrt\b/g, "1").replace(/\bMath\.PI\b/g, "1");
+      if (!/^[0-9+\-*/().\s]+$/.test(normalized)) return undefined;
+
+      const out = Function(`"use strict"; return (${expr});`)();
+      const val = Number(out);
+      return Number.isFinite(val) ? val : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const tokenizeFormula = (formula: string): string[] =>
+    formula.match(/[A-Za-z_][A-Za-z0-9_.]*|\d+(?:\.\d+)?|[()+\-*/]/g) ?? [];
+
+  const joinFormulaTokens = (tokens: string[]): string => tokens.join(" ").trim();
 
   const loadColDefs = useCallback(async () => {
     if (!title) return;
@@ -283,6 +320,13 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
 
       const existingKeys = new Set(fields.map(f => f.key));
       const primaryRows = (results[0]?.data ?? []) as any[];
+      const fMap: Record<string, string> = {};
+      for (const row of primaryRows) {
+        if (row.is_computed && row.formula) {
+          fMap[row.column_name] = String(row.formula);
+        }
+      }
+      setFormulaMap(fMap);
       const extra: FieldDef[] = primaryRows
         .filter(row => !existingKeys.has(row.column_name) && row.is_id !== 'pk')
         .map(row => ({
@@ -326,6 +370,17 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  useEffect(() => {
+    if (!open || pkField !== "column_def_id") return;
+    apiClient.get<any[]>("/api/masters/column-defs").then((r) => {
+      const refs = Array.from(new Set((r.data ?? [])
+        .filter((row: any) => row?.column_name)
+        .map((row: any) => `${String(row.table_name ?? "").toUpperCase()}.${String(row.column_name)}`)
+      )).sort();
+      setFormulaGlobalRefs(refs);
+    }).catch(() => setFormulaGlobalRefs([]));
+  }, [open, pkField]);
+
   const openAdd  = () => { setEditing(null); setForm({}); setOpen(true); };
   const openEdit = (item: any) => { setEditing(item); setForm({ ...item }); setOpen(true); };
 
@@ -360,6 +415,10 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
 
   const handleSave = async () => {
     const payload = { ...form };
+    for (const [fieldKey, formula] of Object.entries(formulaMap)) {
+      const v = computeFormulaValue(formula, payload);
+      if (v !== undefined) payload[fieldKey] = v;
+    }
     for (const f of [...fields, ...extraFields]) {
       if (f.disabledWhen?.(form)) {
         const dv = f.defaultWhen?.(form);
@@ -607,12 +666,15 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
                                   ? formatDate(item[f.key], true)
                                   : (() => {
                                       const val = item[f.key];
-                                      if (val != null) {
-                                        const cand = candidatesMap[f.key]?.find(c => c.label === String(val));
+                                      const displayVal = (val == null && formulaMap[f.key])
+                                        ? computeFormulaValue(formulaMap[f.key], item)
+                                        : val;
+                                      if (displayVal != null) {
+                                        const cand = candidatesMap[f.key]?.find(c => c.label === String(displayVal));
                                         if (cand?.color) {
                                           return <Chip label={cand.label} size="small" sx={{ bgcolor: cand.color, color: "#fff", fontWeight: 700, height: 20, fontSize: 11, borderRadius: "10px" }} />;
                                         }
-                                        return <>{String(val)}</>;
+                                        return <>{String(displayVal)}</>;
                                       }
                                       return <>—</>;
                                     })()}
@@ -706,8 +768,114 @@ export function EntityCrud({ title, fields, pkField, api, buildTree, onReorder, 
         <DialogContent>
           <Box sx={{ display: "flex", flexDirection: "column", gap: 2, pt: 1 }}>
             {orderedFields.map(f => {
-              const isDisabled   = f.disabledWhen?.(form) ?? false;
-              const defaultValue = f.defaultWhen?.(form);
+              const computedFormula = formulaMap[f.key];
+              const computedValue = computedFormula ? computeFormulaValue(computedFormula, form) : undefined;
+              const isDisabled   = !!computedFormula || (f.disabledWhen?.(form) ?? false);
+              const defaultValue = computedFormula
+                ? (computedValue !== undefined ? computedValue : "")
+                : f.defaultWhen?.(form);
+
+              if (pkField === "column_def_id" && f.key === "formula") {
+                const tokens = tokenizeFormula(String(form[f.key] ?? ""));
+                const currentCol = String(form.column_name ?? "");
+                const localCols = items
+                  .map((it) => String(it.column_name ?? ""))
+                  .filter(Boolean)
+                  .filter((c, idx, arr) => arr.indexOf(c) === idx)
+                  .filter((c) => c !== currentCol);
+                const availableRefs = Array.from(new Set([
+                  ...localCols,
+                  ...formulaGlobalRefs,
+                ]));
+                const selectedRef = formulaPick[f.key] ?? "";
+                const numberText = formulaNumber[f.key] ?? "";
+
+                const appendTokens = (...nextTokens: string[]) => {
+                  if (isDisabled || nextTokens.length === 0) return;
+                  const next = [...tokens, ...nextTokens.filter(Boolean)];
+                  setForm((prev) => ({ ...prev, [f.key]: joinFormulaTokens(next) || null }));
+                };
+                const removeTokenAt = (idx: number) => {
+                  if (isDisabled) return;
+                  const next = tokens.filter((_, i) => i !== idx);
+                  setForm((prev) => ({ ...prev, [f.key]: joinFormulaTokens(next) || null }));
+                };
+
+                return (
+                  <Box key={f.key}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, display: "block", mb: 0.5, color: "text.secondary" }}>
+                      {f.label}
+                    </Typography>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 1, p: 0.75, border: "1px solid", borderColor: "divider", borderRadius: 1, minHeight: 44 }}>
+                      {tokens.length === 0 ? (
+                        <Typography variant="caption" color="text.disabled">Select columns and operators to build formula</Typography>
+                      ) : tokens.map((t, i) => (
+                        <Chip key={`${t}-${i}`} label={t} size="small" onDelete={isDisabled ? undefined : () => removeTokenAt(i)} />
+                      ))}
+                    </Box>
+
+                    <Box sx={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 1, alignItems: "center" }}>
+                      <FormControl size="small" fullWidth disabled={isDisabled || availableRefs.length === 0}>
+                        <InputLabel>Field</InputLabel>
+                        <Select
+                          value={selectedRef}
+                          label="Field"
+                          onChange={(e) => setFormulaPick((prev) => ({ ...prev, [f.key]: String(e.target.value || "") }))}
+                        >
+                          <MenuItem value="">— select —</MenuItem>
+                          {availableRefs.map((ref) => (
+                            <MenuItem key={ref} value={ref}>{ref}</MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                      <Button size="small" variant="outlined" disabled={isDisabled || !selectedRef} onClick={() => appendTokens(selectedRef)}>
+                        Add Field
+                      </Button>
+                      <Button size="small" variant="outlined" disabled={isDisabled || tokens.length === 0} onClick={() => setForm((prev) => ({ ...prev, [f.key]: null }))}>
+                        Clear
+                      </Button>
+                    </Box>
+
+                    <Box sx={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 1, alignItems: "center", mt: 1, p: 1, borderRadius: 1, bgcolor: "#fff9c4" }}>
+                      <TextField
+                        size="small"
+                        label="Number"
+                        type="number"
+                        value={numberText}
+                        disabled
+                        helperText="Numeric input is disabled"
+                        onChange={(e) => setFormulaNumber((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                      />
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled
+                        onClick={() => {
+                          const n = Number(numberText);
+                          if (!Number.isFinite(n)) return;
+                          appendTokens(String(n));
+                        }}
+                      >
+                        Add Number
+                      </Button>
+                    </Box>
+
+                    <Box sx={{ display: "flex", gap: 0.75, mt: 1, flexWrap: "wrap" }}>
+                      {["+", "-", "*", "/", "(", ")"].map((op) => (
+                        <Button key={op} size="small" variant="outlined" disabled={isDisabled} onClick={() => appendTokens(op)}>
+                          {op}
+                        </Button>
+                      ))}
+                      <Button size="small" variant="outlined" disabled={isDisabled} onClick={() => appendTokens("pi")}>
+                        π
+                      </Button>
+                      <Button size="small" variant="outlined" disabled={isDisabled} onClick={() => appendTokens("sqrt", "(")}>
+                        sqrt(
+                      </Button>
+                    </Box>
+                  </Box>
+                );
+              }
 
               // ── tags: chip-list editor with color picker per entry ──
               if (f.type === "tags") {

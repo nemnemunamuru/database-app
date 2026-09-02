@@ -1,7 +1,8 @@
 ﻿import { useState, useEffect, useCallback } from "react";
 import {
-  Box, Button, CircularProgress,
-  IconButton, InputAdornment, Paper, Table, TableBody,
+  Box, Button, Checkbox, CircularProgress,
+  Dialog, DialogActions, DialogContent, DialogTitle,
+  FormControlLabel, IconButton, InputAdornment, Paper, Table, TableBody,
   TableCell, TableContainer, TableHead, TableRow,
   TextField, Tooltip, Typography,
 } from "@mui/material";
@@ -12,7 +13,7 @@ import EditIcon from "@mui/icons-material/Edit";
 import type { Experiment, ExperimentDetail } from "../../api/experiments";
 import {
   fetchExperiments, fetchExperimentDetail, deleteExperiment,
-  cloneExperiment,
+  cloneExperiment, fetchExperimentExportColumns, exportExperimentsCsv,
 } from "../../api/experiments";
 import { columnDefsTableApi } from "../../api/masters";
 import type { Candidate } from "../masters/EntityCrud";
@@ -53,12 +54,15 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [candidatesMap, setCandidatesMap] = useState<Record<string, Candidate[]>>({});
   const [customCols, setCustomCols] = useState<{ column_name: string }[]>([]);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportColumns, setExportColumns] = useState<string[]>([]);
+  const [selectedExportColumns, setSelectedExportColumns] = useState<string[]>([]);
 
   useEffect(() => {
     const TABLES = [
       "GALVANO_SYSTEM", "FTHETA", "OPTICS", "LASER_DEVICE", "LASER_BEAM", "DOE",
-      "WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER",
-      "SUB_TRAJECTORY", "WOBBLING_PARAMETER",
+      "WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "CIRCLE_PARAMETER", "LINE_PARAMETER", "SPIRAL_PARAMETER",
+      "SUB_TRAJECTORY", "EIGHT_PARAMETER", "RASTER_PARAMETER", "WOBBLING_PARAMETER",
       "EXPERIMENT_MATERIAL", "MATERIAL_STATE", "MATERIAL",
       "SHIELDING_CONDITION", "RESULT", "OBSERVATION", "FILE",
     ];
@@ -80,6 +84,11 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
         .sort((a, b) => (a.order_index ?? 999) - (b.order_index ?? 999));
       setCustomCols(cols);
     }).catch(() => {});
+    fetchExperimentExportColumns().then((res) => {
+      const cols = res.data.columns ?? [];
+      setExportColumns(cols);
+      setSelectedExportColumns(cols);
+    }).catch(() => setExportColumns([]));
   }, []);
 
   const load = useCallback(async (keyword = "") => {
@@ -130,11 +139,32 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
   const showDetail  = detail !== null || detailLoading;
   const colSpanCount = 10 + customCols.length;
 
+  const toggleExportColumn = (key: string) => {
+    setSelectedExportColumns((prev) =>
+      prev.includes(key)
+        ? prev.filter((v) => v !== key)
+        : [...prev, key]
+    );
+  };
+
+  const handleExportCsv = async () => {
+    const res = await exportExperimentsCsv(selectedExportColumns);
+    const blob = new Blob([res.data], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "experiments_export.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+    setExportOpen(false);
+  };
+
   return (
     <Box sx={{ width: "100%" }}>
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1.5 }}>
         <Typography variant="h6">Experiments (total: {total})</Typography>
         <Box sx={{ display: "flex", gap: 1 }}>
+          <Button variant="outlined" size="small" onClick={() => setExportOpen(true)}>CSV Export</Button>
           <Button variant="contained" size="small" onClick={onAddNew}>+ Add New</Button>
         </Box>
       </Box>
@@ -153,6 +183,30 @@ export default function ExperimentList({ onSelect, onAddNew, refresh }: Props) {
         }}
         sx={{ mb: 1.5, width: 260 }}
       />
+
+      <Dialog open={exportOpen} onClose={() => setExportOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>CSV export column selection</DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 1, pt: 1 }}>
+            {exportColumns.map((key) => (
+              <FormControlLabel
+                key={key}
+                control={
+                  <Checkbox
+                    checked={selectedExportColumns.includes(key)}
+                    onChange={() => toggleExportColumn(key)}
+                  />
+                }
+                label={key}
+              />
+            ))}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setExportOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={handleExportCsv}>Download</Button>
+        </DialogActions>
+      </Dialog>
 
       {loading ? <CircularProgress /> : (
         <Box sx={{ display: "flex", gap: 1.5, alignItems: "flex-start", width: "100%" }}>

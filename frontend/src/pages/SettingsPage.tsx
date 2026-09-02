@@ -30,6 +30,11 @@ const CHATBOT_SIZES = [
 const COLUMN_DEF_FIELDS: FieldDef[] = [
   { key: "column_name", label: "column_name", type: "text",
     endAdornment: (form) => form.is_id === "id" ? "_id" : form.is_id === "role" ? "_role" : undefined },
+  { key: "is_computed", label: "is_computed", type: "boolean",
+    disabledWhen: (form) => form.is_id === "id" || form.is_id === "role" },
+  { key: "formula",     label: "formula",     type: "text",
+    disabledWhen: (form) => !form.is_computed,
+    defaultWhen: (form) => form.is_computed ? (form.formula ?? "") : "" },
   { key: "data_type",   label: "data_type",   type: "text",
     options: ["string", "float", "integer", "boolean", "text", "uuid", "date", "datetime", "path"],
     disabledWhen: (form) => form.is_id === "id",
@@ -40,7 +45,7 @@ const COLUMN_DEF_FIELDS: FieldDef[] = [
     options: ["id", "role", ""],
     disabledWhen: (form) => form.data_type === "date" || form.data_type === "datetime" },
   { key: "candidates",  label: "candidates",  type: "tags",
-    disabledWhen: (form) => form.is_id === "id" || form.data_type === "date" || form.data_type === "datetime" },
+    disabledWhen: (form) => form.is_computed || form.is_id === "id" || form.data_type === "date" || form.data_type === "datetime" },
 ];
 
 // Table groups for two-level tab navigation
@@ -48,7 +53,7 @@ const TABLE_GROUPS = [
   { key: "EXPERIMENT",     label: "EXPERIMENT",       color: "#1565c0", tables: ["EXPERIMENT"] },
   { key: "PROJECT",        label: "PROJECT",          color: "#26a69a", tables: ["PROJECT"] },
   { key: "GALVANO_SYSTEM", label: "GALVANO_SYSTEM",   color: "#6a1b9a", tables: ["GALVANO_SYSTEM", "FTHETA", "OPTICS", "LASER_DEVICE", "LASER_BEAM", "DOE"] },
-  { key: "WELDING",        label: "WELDING",          color: "#2e7d32", tables: ["WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER", "SUB_TRAJECTORY", "WOBBLING_PARAMETER"] },
+  { key: "WELDING",        label: "WELDING",          color: "#2e7d32", tables: ["WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "CIRCLE_PARAMETER", "LINE_PARAMETER", "SPIRAL_PARAMETER", "SUB_TRAJECTORY", "EIGHT_PARAMETER", "RASTER_PARAMETER", "WOBBLING_PARAMETER"] },
   { key: "MATERIAL",       label: "MATERIAL",         color: "#00695c", tables: ["EXPERIMENT_MATERIAL", "MATERIAL_STATE", "MATERIAL"] },
   { key: "SHIELDING",      label: "SHIELDING",        color: "#5d4037", tables: ["SHIELDING_CONDITION"] },
   { key: "RESULT",         label: "RESULT",           color: "#ad1457", tables: ["RESULT"] },
@@ -63,8 +68,8 @@ const TABLE_COLOR_MAP: Record<string, string> = {
   GALVANO_SYSTEM: "#6a1b9a", FTHETA: "#6a1b9a", OPTICS: "#6a1b9a",
   LASER_DEVICE: "#6a1b9a", LASER_BEAM: "#6a1b9a", DOE: "#6a1b9a",
   WELDING_CONDITION: "#2e7d32", TRAJECTORY_SET: "#2e7d32",
-  MAIN_TRAJECTORY: "#2e7d32", LINE_PARAMETER: "#2e7d32",
-  SUB_TRAJECTORY: "#e65100", WOBBLING_PARAMETER: "#e65100",
+  MAIN_TRAJECTORY: "#2e7d32", CIRCLE_PARAMETER: "#2e7d32", LINE_PARAMETER: "#2e7d32", SPIRAL_PARAMETER: "#2e7d32",
+  SUB_TRAJECTORY: "#e65100", EIGHT_PARAMETER: "#e65100", RASTER_PARAMETER: "#e65100", WOBBLING_PARAMETER: "#e65100",
   EXPERIMENT_MATERIAL: "#00695c", MATERIAL_STATE: "#00695c", MATERIAL: "#00695c",
   SHIELDING_CONDITION: "#5d4037",
   RESULT: "#ad1457",
@@ -161,7 +166,7 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false, 
   }, [schemaKey]);
 
   // Build the full groups list (static + dynamic trajectory param tables in WELDING + extra groups)
-  const WELDING_STATIC = ["WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER", "SUB_TRAJECTORY", "WOBBLING_PARAMETER"];
+  const WELDING_STATIC = ["WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER", "SUB_TRAJECTORY", "WOBBLING_PARAMETER", "CIRCLE_PARAMETER", "SPIRAL_PARAMETER", "EIGHT_PARAMETER", "RASTER_PARAMETER"];
   const knownParamTables = new Set(WELDING_STATIC);
   const extraParamTables = dynParamTables.filter(t => !knownParamTables.has(t));
 
@@ -200,6 +205,8 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false, 
           ...data,
           column_name: columnName,
           table_name: activeTable,
+          is_computed: !!data.is_computed,
+          formula: data.is_computed ? (data.formula ?? "") : null,
           is_id: isId,
           ...(isId === "pk" || isId === "fk" ? { data_type: "uuid", candidates: null } : {}),
         });
@@ -224,6 +231,8 @@ export default function SettingsPage({ darkMode, onToggleDark, isAdmin = false, 
         const isId = resolveIsId(activeTable, data.column_name ?? "", data.is_id ?? "");
         const resolved = {
           ...data,
+          is_computed: !!data.is_computed,
+          formula: data.is_computed ? (data.formula ?? "") : null,
           is_id: isId,
           ...(isId === "pk" || isId === "fk" ? { data_type: "uuid", candidates: null } : {}),
         };

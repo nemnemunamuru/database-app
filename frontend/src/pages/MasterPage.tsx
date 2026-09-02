@@ -708,7 +708,7 @@ const COLUMN_DEF_FIELDS: FieldDef[] = [
 // ── Dynamic trajectory parameter table CRUD ───────────────────────────────────
 function DynParamCrud({ title, slug, pkCol }: { title: string; slug: string; pkCol: string }) {
   const tableUpper = slug.replace(/-/g, "_").toUpperCase();
-  const [fields, setFields] = useState<FieldDef[]>([{ key: "remarks", label: "remarks", type: "text" }]);
+  const [fields, setFields] = useState<FieldDef[]>([]);
   useEffect(() => {
     columnDefsTableApi(tableUpper).list().then(r => {
       const defs = (r.data as any[]).filter(c => c.is_id !== "pk" && c.is_id !== "fk");
@@ -718,6 +718,8 @@ function DynParamCrud({ title, slug, pkCol }: { title: string; slug: string; pkC
           label: c.column_name + (c.unit ? ` [${c.unit}]` : ""),
           type: c.data_type === "float" || c.data_type === "integer" ? "number" : "text",
         })));
+      } else {
+        setFields([]);
       }
     }).catch(() => {});
   }, [tableUpper]);
@@ -749,6 +751,15 @@ export default function MasterPage() {
       .then(r => setTrajectoryTypeDefs(Array.isArray(r.data) ? r.data : []))
       .catch(() => {});
   }, []);
+
+  const mainDynDefs = useMemo(
+    () => trajectoryTypeDefs.filter(d => d.parent === "main" && d.param_table !== "line_parameter"),
+    [trajectoryTypeDefs],
+  );
+  const subDynDefs = useMemo(
+    () => trajectoryTypeDefs.filter(d => d.parent === "sub" && d.param_table !== "wobbling_parameter"),
+    [trajectoryTypeDefs],
+  );
 
   // Stable references for candidatesTables arrays to prevent spurious useEffect re-runs
   const galvanoCandidates  = useMemo(() => ["OPTICS", "LASER_BEAM"], []);
@@ -799,20 +810,22 @@ export default function MasterPage() {
             <Tab label="TRAJECTORY_SET" />
             <Tab label="MAIN_TRAJECTORY" />
             {/* Dynamic main trajectory parameter tabs */}
-            {trajectoryTypeDefs.filter(d => d.parent === "main").map(d => (
+            {mainDynDefs.map(d => (
               <Tab key={d.type_def_id} label={d.param_table.toUpperCase()} />
             ))}
+            <Tab label="LINE_PARAMETER" />
             <Tab label="SUB_TRAJECTORY" />
             {/* Dynamic sub trajectory parameter tabs */}
-            {trajectoryTypeDefs.filter(d => d.parent === "sub").map(d => (
+            {subDynDefs.map(d => (
               <Tab key={d.type_def_id} label={d.param_table.toUpperCase()} />
             ))}
+            <Tab label="WOBBLING_PARAMETER" />
           </Tabs>
           <Box sx={{ display: subTab1 === 0 ? "" : "none" }}><EntityCrud title="WELDING_CONDITION" fields={WELDING_FIELDS} pkField="welding_condition_id" api={weldingConditionsApi} expandable buildTree={buildWeldingTree} /></Box>
           <Box sx={{ display: subTab1 === 1 ? "" : "none" }}><EntityCrud title="TRAJECTORY_SET" fields={TRAJECTORY_SET_FIELDS} pkField="trajectory_set_id" api={trajectorySetsApi} expandable buildTree={buildTrajectorySetTree} /></Box>
           <Box sx={{ display: subTab1 === 2 ? "" : "none" }}><EntityCrud title="MAIN_TRAJECTORY" fields={MAIN_TRAJECTORY_FIELDS} pkField="main_trajectory_id" api={mainTrajectoriesApi} expandable buildTree={buildMainTrajectoryTree} /></Box>
           {/* Dynamic main parameter tabs */}
-          {trajectoryTypeDefs.filter(d => d.parent === "main").map((d, i) => {
+          {mainDynDefs.map((d, i) => {
             const tabIdx = 3 + i;
             const slug = d.param_table.replace(/_/g, "-");
             return (
@@ -821,13 +834,18 @@ export default function MasterPage() {
               </Box>
             );
           })}
-          {/* SUB_TRAJECTORY tab */}
-          <Box sx={{ display: subTab1 === 3 + trajectoryTypeDefs.filter(d => d.parent === "main").length ? "" : "none" }}>
-            <EntityCrud title="SUB_TRAJECTORY" fields={SUB_TRAJECTORY_FIELDS} pkField="sub_trajectory_id" api={subTrajectoriesApi} expandable buildTree={buildSubTrajectoryTree} />
-          </Box>
-          {/* Dynamic sub parameter tabs */}
-          {trajectoryTypeDefs.filter(d => d.parent === "sub").map((d, i) => {
-            const tabIdx = 4 + trajectoryTypeDefs.filter(x => x.parent === "main").length + i;
+          <Box sx={{ display: subTab1 === 3 + mainDynDefs.length ? "" : "none" }}><EntityCrud title="LINE_PARAMETER" fields={LINE_PARAMETER_FIELDS} pkField="main_trajectory_type_parameter_id" api={lineParametersApi} expandable buildTree={buildLineParameterTree} /></Box>
+          {(() => {
+            const subTrajectoryTabIdx = 4 + mainDynDefs.length;
+            return (
+              <Box sx={{ display: subTab1 === subTrajectoryTabIdx ? "" : "none" }}>
+                <EntityCrud title="SUB_TRAJECTORY" fields={SUB_TRAJECTORY_FIELDS} pkField="sub_trajectory_id" api={subTrajectoriesApi} expandable buildTree={buildSubTrajectoryTree} />
+              </Box>
+            );
+          })()}
+          {/* Dynamic sub trajectory parameter tabs */}
+          {subDynDefs.map((d, i) => {
+            const tabIdx = 5 + mainDynDefs.length + i;
             const slug = d.param_table.replace(/_/g, "-");
             return (
               <Box key={d.type_def_id} sx={{ display: subTab1 === tabIdx ? "" : "none" }}>
@@ -835,6 +853,9 @@ export default function MasterPage() {
               </Box>
             );
           })}
+          <Box sx={{ display: subTab1 === 5 + mainDynDefs.length + subDynDefs.length ? "" : "none" }}>
+            <EntityCrud title="WOBBLING_PARAMETER" fields={WOBBLING_PARAMETER_FIELDS} pkField="sub_trajectory_type_parameter_id" api={wobblingParametersApi} expandable buildTree={buildWobblingParameterTree} />
+          </Box>
         </Box>
       </Box>
 

@@ -151,7 +151,7 @@ erDiagram
 
     RESULT {
         uuid result_id PK
-        string oct_depth_mm
+        float oct_depth_mm
         path oct_surface_csv_path
         path oct_depth_csv_path
         path oct_result_csv_path
@@ -172,7 +172,7 @@ erDiagram
     SHIELDING_CONDITION {
         uuid shielding_condition_id PK
         string gas_type
-        string gas_purity_percent
+        float gas_purity_percent
         float gas_flow_l_min
         float gas_pressure_kpa
         string nozzle_type
@@ -204,10 +204,10 @@ erDiagram
 
     WELDING_CONDITION {
         uuid welding_condition_id PK
-        string main_power_w
-        string sub_power_w
-        string welding_speed_mm_s
-        string main_focus_offset_mm
+        float main_power_w
+        float sub_power_w
+        float welding_speed_mm_s
+        float main_focus_offset_mm
         string sub_focus_offset_mm
         uuid trajectory_set_id FK
         string remarks

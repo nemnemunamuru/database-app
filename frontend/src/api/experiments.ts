@@ -109,8 +109,20 @@ export const deleteExperiment = (id: string) =>
 export const cloneExperiment = (id: string) =>
   api.post<Experiment>(`/api/experiments/${id}/clone`);
 
-export const exportExperimentsCsv = () =>
-  api.get("/api/io/export/experiments/csv", { responseType: "blob" });
+export const writeExperimentResult = (id: string, fields: Record<string, number>) =>
+  api.post<{ result_id: string } & Record<string, number>>(`/api/experiments/${id}/write-result`, fields);
+
+export const fetchExperimentExportColumns = (projectId?: string) =>
+  api.get<{ columns: string[]; default_columns: string[] }>("/api/experiments/export/columns", { params: { project_id: projectId } });
+
+export const exportExperimentsCsv = (columns?: string[], projectId?: string) =>
+  api.get("/api/experiments/export/csv", {
+    params: {
+      columns: columns ? columns.join(",") : undefined,
+      project_id: projectId,
+    },
+    responseType: "blob",
+  });
 
 export const getLogFile = (filename: string, ds: number) =>
   api.get<{ headers: string[]; rows: Record<string, number>[] }>(`/api/io/log-file/${encodeURIComponent(filename)}`, { params: { ds } });

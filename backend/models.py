@@ -106,6 +106,16 @@ class LineParameter(Base):
     main_trajectories = relationship("MainTrajectory", back_populates="line_parameter")
 
 
+class CircleParameter(Base):
+    __tablename__ = "circle_parameter"
+    main_trajectory_type_parameter_id = Column(String, primary_key=True, default=new_uuid)
+
+
+class SpiralParameter(Base):
+    __tablename__ = "spiral_parameter"
+    main_trajectory_type_parameter_id = Column(String, primary_key=True, default=new_uuid)
+
+
 class MainTrajectory(Base):
     __tablename__ = "main_trajectory"
     main_trajectory_id = Column(String, primary_key=True, default=new_uuid)
@@ -127,6 +137,16 @@ class WobblingParameter(Base):
     remarks = Column(Text)
 
     sub_trajectories = relationship("SubTrajectory", back_populates="wobbling_parameter")
+
+
+class EightParameter(Base):
+    __tablename__ = "eight_parameter"
+    sub_trajectory_type_parameter_id = Column(String, primary_key=True, default=new_uuid)
+
+
+class RasterParameter(Base):
+    __tablename__ = "raster_parameter"
+    sub_trajectory_type_parameter_id = Column(String, primary_key=True, default=new_uuid)
 
 
 class SubTrajectory(Base):
@@ -305,6 +325,8 @@ class ColumnDef(Base):
     data_type = Column(String)
     unit = Column(String)
     is_id = Column(String, default="")
+    is_computed = Column(Boolean, default=False)
+    formula = Column(Text)
     candidates = Column(Text)
     order_index = Column(Integer, default=0)
 

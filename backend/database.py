@@ -106,5 +106,17 @@ def _migrate():
             conn.execute(text("ALTER TABLE experiment ADD COLUMN project_id TEXT REFERENCES project(project_id)"))
             conn.commit()
             cols.add("project_id")
+
+        # Ensure column_def has computed-column metadata fields
+        coldef_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(column_def)"))}
+        if "is_computed" not in coldef_cols:
+            conn.execute(text("ALTER TABLE column_def ADD COLUMN is_computed INTEGER DEFAULT 0"))
+            conn.commit()
+            coldef_cols.add("is_computed")
+        if "formula" not in coldef_cols:
+            conn.execute(text("ALTER TABLE column_def ADD COLUMN formula TEXT"))
+            conn.commit()
+            coldef_cols.add("formula")
+
         # Auto-add custom columns defined in column_defs for EXPERIMENT table
         _migrate_experiment_custom_cols(conn, cols)

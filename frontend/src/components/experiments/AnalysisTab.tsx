@@ -19,11 +19,11 @@ import VisibilityIcon from "@mui/icons-material/Visibility";
 import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import {
   CartesianGrid, Legend, Line, LineChart, ReferenceArea,
-  ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis,
+  ResponsiveContainer, Scatter, ScatterChart, Tooltip as ChartTooltip, XAxis, YAxis, ZAxis,
 } from "recharts";
 
 import type { Experiment } from "../../api/experiments";
-import { fetchExperimentDetail, fetchExperiments, getLogFile } from "../../api/experiments";
+import { fetchExperimentDetail, fetchExperiments, getLogFile, writeExperimentResult } from "../../api/experiments";
 import { projectsApi } from "../../api/projects";
 import type { ProjectExperiment, Project } from "../../api/projects";
 import { columnDefsApi } from "../../api/masters";
@@ -33,7 +33,7 @@ import { type FilterState, FILTER_DEFAULT, matchDeep } from "../../utils/experim
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type SeriesType    = "line" | "scatter";
-type ChartMode     = "2d" | "3d" | "dist";
+type ChartMode     = "2d" | "3d" | "dist" | "exp";
 type MarkerShape2D = "circle" | "square" | "triangle" | "diamond";
 
 interface SeriesStyle {
@@ -66,6 +66,7 @@ interface AvgRangeConfig {
   xMax: string;
   yCols: string[]; // empty = use all effectiveY
   label: string;
+  fieldMap?: Record<string, string>; // col/pfId → result field name (e.g. oct_depth_mm)
 }
 
 interface DisplayItem {
@@ -205,6 +206,17 @@ const parsePathCol = (pc: string) => {
 };
 const basename = (p: string) => (p.split(/[/\\]/).filter(Boolean).at(-1) ?? p).trim();
 
+function normalizeLogPath(raw: string): string {
+  const s0 = String(raw ?? "").trim().replace(/^['"]+|['"]+$/g, "");
+  if (!s0) return "";
+  const s = s0.replace(/\\/g, "/");
+  const dataIdx = s.toLowerCase().lastIndexOf("/data/");
+  if (dataIdx >= 0) return s.slice(dataIdx + 6).replace(/^\/+/, "");
+  if (s.toLowerCase().startsWith("data/")) return s.slice(5).replace(/^\/+/, "");
+  if (/^[a-zA-Z]:\//.test(s)) return basename(s);
+  return s.replace(/^\.?\/+/, "");
+}
+
 function findInDetail(detail: any, col: string): string | null {
   if (!detail) return null;
   if (col in detail && detail[col] != null) return String(detail[col]);
@@ -212,6 +224,32 @@ function findInDetail(detail: any, col: string): string | null {
     if (val && typeof val === "object" && !Array.isArray(val))
       if (col in (val as any) && (val as any)[col] != null) return String((val as any)[col]);
   return null;
+}
+
+function toFiniteNumber(val: unknown): number | undefined {
+  if (typeof val === "number") return isFinite(val) ? val : undefined;
+  if (typeof val === "boolean") return val ? 1 : 0;
+  if (typeof val === "string") {
+    const s = val.trim();
+    if (!s) return undefined;
+    const n = Number(s);
+    return isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+// Flatten an experiment detail object into a Record<leafKey, number>
+// Arrays: only the first element is walked. Booleans become 0/1.
+function flattenExpDetail(obj: unknown, result: Record<string, number> = {}, depth = 0): Record<string, number> {
+  if (depth > 8 || obj === null || obj === undefined || typeof obj !== "object") return result;
+  for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
+    if (val === null || val === undefined) continue;
+    const num = toFiniteNumber(val);
+    if (num !== undefined) { result[key] = num; }
+    else if (Array.isArray(val)) { if (val.length > 0) flattenExpDetail(val[0], result, depth + 1); }
+    else if (typeof val === "object") { flattenExpDetail(val, result, depth + 1); }
+  }
+  return result;
 }
 
 function resolveFilename(
@@ -227,7 +265,9 @@ function resolveFilename(
   } else {
     raw = findInDetail(detailCache[entry.experiment_id], col);
   }
-  return raw ? basename(raw) : null;
+  if (!raw) return null;
+  const p = normalizeLogPath(raw);
+  return p || basename(raw) || null;
 }
 
 function createDisplayItem(chartContext = "main"): DisplayItem {
@@ -276,6 +316,33 @@ function rollingPercentile(data: number[], n: number, p: number): number[] {
     const end   = Math.min(data.length - 1, i + half);
     const win   = data.slice(start, end + 1).filter(v => isFinite(v));
     return win.length > 0 ? calcPercentile(win, p) : NaN;
+  });
+}
+
+function withPfComputedRows(entryRows: Record<string, number>[], item: DisplayItem): Record<string, number>[] {
+  if (!entryRows.length || !item.pfEnabled || (item.pfSeries ?? []).length === 0) return entryRows;
+  const rawN = parseInt(item.pfWindowN || "11", 10) || 11;
+  const n = rawN % 2 === 0 ? rawN + 1 : rawN;
+  const p = parseNum(item.pfPercent || "50") ?? 50;
+  const headers = new Set(Object.keys(entryRows[0] ?? {}));
+  const computed: Record<string, number[]> = {};
+
+  for (const pf of item.pfSeries ?? []) {
+    const srcData = headers.has(pf.yCol)
+      ? entryRows.map(r => r[pf.yCol])
+      : (computed[pf.yCol] ?? null);
+    if (!srcData) continue;
+    computed[pf.id] = rollingPercentile(srcData, n, p);
+  }
+
+  if (Object.keys(computed).length === 0) return entryRows;
+  return entryRows.map((row, i) => {
+    const next = { ...row };
+    for (const pf of item.pfSeries ?? []) {
+      const arr = computed[pf.id];
+      if (arr !== undefined) next[pf.id] = arr[i];
+    }
+    return next;
   });
 }
 
@@ -499,6 +566,7 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
   onBatchReportDone?: () => void;
 } = {}) {
   const [entries, setEntries]     = useState<ExpEntry[]>([]);
+  const [projectEntries, setProjectEntries] = useState<ExpEntry[]>([]);
   const [mainRaw, setMainRaw]     = useState<Record<string,Experiment>>({});
   const [projRaw, setProjRaw]     = useState<Record<string,ProjectExperiment>>({});
   const [projects, setProjects]   = useState<Project[]>([]);
@@ -508,6 +576,8 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
   const [detailCache, setDetailCache]   = useState<Record<string,any>>({});
   const [dataCache, setDataCache]       = useState<DataCache>({});
   const [headersCache, setHeadersCache] = useState<HeadersCache>({});
+  const [expFlatCache, setExpFlatCache] = useState<Record<string, Record<string, number>>>({});
+  const loadingExpIdsRef = useRef(new Set<string>());
   const [loadingFiles, setLoadingFiles] = useState<Set<string>>(new Set());
   const [fileErrors, setFileErrors]     = useState<Set<string>>(new Set());
   const loadedRef = useRef(new Set<string>());
@@ -557,6 +627,7 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
         const pRaw: Record<string,ProjectExperiment>={};
         r.data.forEach(e=>{pRaw[e.experiment_id]=e;});
         setProjRaw(pRaw);
+        setProjectEntries([]);
         setEntries(r.data.map(e=>({experiment_id:e.experiment_id,remarks:e.remarks,source:projectId})));
       }).catch(()=>{}).finally(()=>setLoading(false));
     } else {
@@ -567,13 +638,18 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
         const pList: Project[] = projRes.data;
         setProjects(pList);
         const pRaw: Record<string,ProjectExperiment>={};
+        const pEntries: ExpEntry[] = [];
         await Promise.all(pList.map(async p=>{
           try {
             const er=await projectsApi.listExperiments(p.project_id);
-            er.data.forEach(e=>{pRaw[e.experiment_id]=e;});
+            er.data.forEach(e=>{
+              pRaw[e.experiment_id]=e;
+              pEntries.push({ experiment_id: e.experiment_id, remarks: e.remarks, source: p.project_id });
+            });
           } catch{/***/}
         }));
         setProjRaw(pRaw);
+        setProjectEntries(pEntries);
         // Only main experiments in the list
         setEntries(expRes.data.items.map(e=>({experiment_id:e.experiment_id,remarks:e.remarks,source:"main" as const})));
       }).catch(()=>{}).finally(()=>setLoading(false));
@@ -591,6 +667,57 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       .then(r=>setDetailCache(prev=>({...prev,[selectedExpId]:r.data}))).catch(()=>{});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedExpId, displayItems, entries]);
+
+  const chartEntries = useMemo<ExpEntry[]>(
+    () => (projectId ? entries : [...entries, ...projectEntries]),
+    [projectId, entries, projectEntries],
+  );
+
+  // Preload all experiment details (flattened) for EXP scatter mode
+  // Always runs when entries change so data is ready before user switches to "exp" mode
+  useEffect(() => {
+    if (chartEntries.length === 0) return;
+    for (const entry of chartEntries) {
+      const id = entry.experiment_id;
+      if (expFlatCache[id] || loadingExpIdsRef.current.has(id)) continue;
+      loadingExpIdsRef.current.add(id);
+      const loader = entry.source === "main"
+        ? fetchExperimentDetail(id)
+        : projectsApi.getExperimentDeep(entry.source, id);
+      loader.then(r => {
+        const flat = flattenExpDetail(r.data as Record<string, unknown>);
+        const raw = entry.source === "main" ? mainRaw[id] : projRaw[id];
+        if (raw) flattenExpDetail(raw as unknown as Record<string, unknown>, flat);
+        setExpFlatCache(prev => ({ ...prev, [id]: flat }));
+      }).catch(() => {
+        // Mark as resolved (empty) so loading indicator doesn't hang
+        setExpFlatCache(prev => ({ ...prev, [id]: {} }));
+      }).finally(() => { loadingExpIdsRef.current.delete(id); });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartEntries, mainRaw, projRaw]);
+
+  // Backfill empty EXP flat-cache entries from main/project raw records.
+  // This recovers columns when older cache entries were populated as {}.
+  useEffect(() => {
+    if (chartEntries.length === 0) return;
+    setExpFlatCache(prev => {
+      let changed = false;
+      const next = { ...prev };
+      for (const entry of chartEntries) {
+        const id = entry.experiment_id;
+        const current = next[id];
+        if (current && Object.keys(current).length > 0) continue;
+        const raw = entry.source === "main" ? mainRaw[id] : projRaw[id];
+        if (!raw) continue;
+        const flat = flattenExpDetail(raw as unknown as Record<string, unknown>);
+        if (Object.keys(flat).length === 0) continue;
+        next[id] = flat;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [chartEntries, mainRaw, projRaw]);
 
   const loadFile = useCallback(async (filename: string, ds: number) => {
     const key=`${filename}@${ds}`;
@@ -642,6 +769,184 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       settingsApi.set(META_KEY, JSON.stringify({ selectedExpId: selectedExpIdRef.current })),
     ]).finally(()=>setSaving(false));
   }, []);
+
+  // Write avg values to Result DB record
+  const handleWriteAvg = useCallback(async (fields: Record<string, number>): Promise<void> => {
+    const expId = selectedExpIdRef.current;
+    if (!expId) throw new Error("No experiment selected");
+    const entry = filteredEntriesRef.current.find(e => e.experiment_id === expId)
+      ?? entries.find(e => e.experiment_id === expId);
+    if (!entry) throw new Error("Experiment not found");
+    if (entry.source === "main") {
+      await writeExperimentResult(expId, fields);
+    } else {
+      await projectsApi.writeResult(entry.source, expId, fields);
+    }
+    // Refresh caches so updated values appear in EXP scatter / detail views
+    const loader = entry.source === "main"
+      ? fetchExperimentDetail(expId)
+      : projectsApi.getExperimentDeep(entry.source, expId);
+    loader.then(r => {
+      const flat = flattenExpDetail(r.data as Record<string, unknown>);
+      setExpFlatCache(prev => ({ ...prev, [expId]: flat }));
+      setDetailCache(prev => ({ ...prev, [expId]: r.data }));
+    }).catch(() => {});
+  }, [entries]);
+
+  const resolveFilenameWithLazyDetail = useCallback(async (
+    entry: ExpEntry,
+    pathCol: string,
+    localDetail: Record<string, any>,
+  ): Promise<string | null> => {
+    let fn = resolveFilename(entry, pathCol, mainRaw, projRaw, localDetail);
+    if (fn) return fn;
+    const { table } = parsePathCol(pathCol);
+    if (table === "EXPERIMENT") return null;
+    try {
+      const r = entry.source === "main"
+        ? await fetchExperimentDetail(entry.experiment_id)
+        : await projectsApi.getExperimentDeep(entry.source, entry.experiment_id);
+      localDetail[entry.experiment_id] = r.data;
+      setDetailCache(prev => prev[entry.experiment_id] ? prev : ({ ...prev, [entry.experiment_id]: r.data }));
+      const flat = flattenExpDetail(r.data as Record<string, unknown>);
+      setExpFlatCache(prev => ({ ...prev, [entry.experiment_id]: flat }));
+      fn = resolveFilename(entry, pathCol, mainRaw, projRaw, localDetail);
+      return fn;
+    } catch {
+      return null;
+    }
+  }, [mainRaw, projRaw]);
+
+  // Batch write: iterate all entries in the display item's context, fetching files on-the-fly
+  const handleBatchWriteAvg = useCallback(async (
+    displayItem: DisplayItem,
+    ar: AvgRangeConfig,
+  ): Promise<{ written: number; skipped: number; failed: number }> => {
+    const ctx = displayItem.chartContext ?? "main";
+    const directEntries = entries.filter(e => ctx === "main" ? e.source === "main" : e.source === ctx);
+    const contextEntries = ctx !== "main" && directEntries.length === 0
+      ? entries
+          .filter(e => e.source === "main" && !!projRaw[e.experiment_id])
+          .map(e => ({ ...e, source: ctx }))
+      : directEntries;
+    let written = 0, skipped = 0, failed = 0;
+    const localFetched: Record<string, Record<string, number>[]> = {};
+    const localDetail: Record<string, any> = { ...detailCache };
+    for (const entry of contextEntries) {
+      const fn = await resolveFilenameWithLazyDetail(entry, displayItem.pathCol, localDetail);
+      if (!fn) { skipped++; continue; }
+      const cacheKey = `${fn}@${displayItem.downsample}`;
+      let entryRows = dataCache[cacheKey] ?? localFetched[cacheKey];
+      if (!entryRows) {
+        try {
+          const r = await getLogFile(fn, displayItem.downsample);
+          localFetched[cacheKey] = r.data.rows;
+          entryRows = r.data.rows;
+        } catch { skipped++; continue; }
+      }
+      if (!entryRows || entryRows.length === 0) { skipped++; continue; }
+      const rowsWithPf = withPfComputedRows(entryRows, displayItem);
+      const xMin = parseNum(ar.xMin); const xMax = parseNum(ar.xMax);
+      const colsToAvg = ar.yCols.length > 0 ? ar.yCols : displayItem.yCols;
+      const filtered = rowsWithPf.filter(r => {
+        const x = r[displayItem.xCol] as number;
+        if (!isFinite(x)) return false;
+        if (xMin !== undefined && x < xMin) return false;
+        if (xMax !== undefined && x > xMax) return false;
+        return true;
+      });
+      if (filtered.length === 0) { skipped++; continue; }
+      const fields: Record<string, number> = {};
+      for (const col of colsToAvg) {
+        const f = ar.fieldMap?.[col]; if (!f) continue;
+        const vals = filtered.map(r => r[col] as number).filter(v => isFinite(v));
+        if (vals.length > 0) fields[f] = vals.reduce((a, b) => a + b, 0) / vals.length;
+      }
+      if (Object.keys(fields).length === 0) { skipped++; continue; }
+      try {
+        if (entry.source === "main") { await writeExperimentResult(entry.experiment_id, fields); }
+        else { await projectsApi.writeResult(entry.source, entry.experiment_id, fields); }
+        written++;
+      } catch { failed++; }
+    }
+    return { written, skipped, failed };
+  }, [entries, projRaw, detailCache, dataCache, resolveFilenameWithLazyDetail]);
+
+  // Top-level "Write All to DB": applies all avg ranges with fieldMap across a target entry list
+  const [writeAllStatus, setWriteAllStatus] = useState<"idle"|"writing"|"ok"|"error">("idle");
+  const [writeAllResult, setWriteAllResult] = useState<{written:number;skipped:number;failed:number}|null>(null);
+  const [writeAllMenuAnchor, setWriteAllMenuAnchor] = useState<HTMLElement|null>(null);
+
+  const handleWriteAllToDb = useCallback(async (targetEntries: ExpEntry[]) => {
+    setWriteAllStatus("writing");
+    setWriteAllResult(null);
+    let written = 0, skipped = 0, failed = 0;
+    // Local fetch cache for files not yet in dataCache (avoids mutating React state mid-loop)
+    const localFetched: Record<string, Record<string, number>[]> = {};
+    const localDetail: Record<string, any> = { ...detailCache };
+    for (const entry of targetEntries) {
+      const fields: Record<string, number> = {};
+      const applicableItems = displayItemsRef.current.filter(displayItem => {
+        const ctx = displayItem.chartContext ?? "main";
+        return ctx === entry.source;
+      });
+      for (const displayItem of applicableItems) {
+        if (!displayItem.pathCol || !displayItem.xCol || displayItem.yCols.length === 0) continue;
+        const fn = await resolveFilenameWithLazyDetail(entry, displayItem.pathCol, localDetail);
+        if (!fn) continue;
+        const cacheKey = `${fn}@${displayItem.downsample}`;
+        let entryRows = dataCache[cacheKey] ?? localFetched[cacheKey];
+        if (!entryRows) {
+          try {
+            const r = await getLogFile(fn, displayItem.downsample);
+            localFetched[cacheKey] = r.data.rows;
+            entryRows = r.data.rows;
+          } catch { continue; }
+        }
+        if (!entryRows || entryRows.length === 0) continue;
+        const rowsWithPf = withPfComputedRows(entryRows, displayItem);
+        for (const ar of displayItem.avgRanges ?? []) {
+          if (!Object.values(ar.fieldMap ?? {}).some(f => f)) continue;
+          const xMin = parseNum(ar.xMin); const xMax = parseNum(ar.xMax);
+          const colsToAvg = ar.yCols.length > 0 ? ar.yCols : displayItem.yCols;
+          const filtered = rowsWithPf.filter(r => {
+            const x = r[displayItem.xCol] as number;
+            if (!isFinite(x)) return false;
+            if (xMin !== undefined && x < xMin) return false;
+            if (xMax !== undefined && x > xMax) return false;
+            return true;
+          });
+          if (filtered.length === 0) continue;
+          for (const col of colsToAvg) {
+            const f = ar.fieldMap?.[col]; if (!f) continue;
+            const vals = filtered.map(r => r[col] as number).filter(v => isFinite(v));
+            if (vals.length > 0) fields[f] = vals.reduce((a, b) => a + b, 0) / vals.length;
+          }
+        }
+      }
+      if (Object.keys(fields).length === 0) { skipped++; continue; }
+      try {
+        if (entry.source === "main") { await writeExperimentResult(entry.experiment_id, fields); }
+        else { await projectsApi.writeResult(entry.source, entry.experiment_id, fields); }
+        written++;
+        // Refresh flat cache so EXP scatter reflects updated values
+        const expId = entry.experiment_id;
+        const loader = entry.source === "main"
+          ? fetchExperimentDetail(expId)
+          : projectsApi.getExperimentDeep(entry.source, expId);
+        loader.then(r => {
+          const flat = flattenExpDetail(r.data as Record<string, unknown>);
+          setExpFlatCache(prev => ({ ...prev, [expId]: flat }));
+          setDetailCache(prev => ({ ...prev, [expId]: r.data }));
+        }).catch(() => {});
+      } catch { failed++; }
+    }
+    const result = { written, skipped, failed };
+    setWriteAllResult(result);
+    setWriteAllStatus(failed > 0 ? "error" : "ok");
+    setTimeout(() => setWriteAllStatus("idle"), 6000);
+    return result;
+  }, [detailCache, dataCache, resolveFilenameWithLazyDetail]);
 
   const updateItem = (id: string, patch: Partial<DisplayItem>) =>
     setDisplayItems(prev=>prev.map(i=>i.id===id?{...i,...patch}:i));
@@ -732,6 +1037,143 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
     await saveCanvases(canvases, dirHandle);
   }, [selectedExpId, ensureDirHandle, saveCanvases]);
 
+  const renderReportHtmlDoc = useCallback((bodyHtml: string) => {
+    return `<style>
+      @page { size: A4 landscape; margin: 8mm; }
+      .pdf-root { font-family: Arial, sans-serif; font-size: 11px; color: #222; }
+      .pdf-root h1,.pdf-root h2,.pdf-root h3,.pdf-root h4 { margin: 8px 0 6px; }
+      .pdf-root p { margin: 4px 0; }
+      .pdf-root table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+      .pdf-root th, .pdf-root td { border: 1px solid #b5b5b5; padding: 4px 6px; vertical-align: top; word-break: break-word; }
+      .pdf-root img { display: block; max-width: 100%; height: auto; }
+      .pdf-root hr { border: none; border-top: 1px solid #ccc; margin: 12px 0; }
+    </style>
+    <div class="pdf-root">${bodyHtml}</div>`;
+  }, []);
+
+  const inlineMarkdownImages = useCallback((md: string, imageDataMap?: Record<string, string>) => {
+    if (!imageDataMap || Object.keys(imageDataMap).length === 0) return md;
+    let out = md;
+    for (const [filename, dataUrl] of Object.entries(imageDataMap)) {
+      const esc = filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(new RegExp(`src=\"${esc}\"`, "g"), `src=\"${dataUrl}\"`);
+      out = out.replace(new RegExp(`\\(${esc}\\)`, "g"), `(${dataUrl})`);
+    }
+    return out;
+  }, []);
+
+  const exportPdfFromMarkdown = useCallback(async (
+    md: string,
+    pdfFilename: string,
+    dirHandle: any | null,
+    imageDataMap?: Record<string, string>,
+  ) => {
+    const markedMod = await import("marked");
+    const jsPdfMod: any = await import("jspdf");
+    const mdInlined = inlineMarkdownImages(md, imageDataMap);
+    const markedParse = (markedMod as any).marked?.parse ?? (markedMod as any).parse;
+    const htmlBody = String(markedParse(mdInlined, { gfm: true, breaks: true }));
+    const htmlDoc = renderReportHtmlDoc(htmlBody);
+
+    const mount = document.createElement("div");
+    mount.style.position = "fixed";
+    mount.style.left = "0";
+    mount.style.top = "0";
+    mount.style.width = "1400px";
+    mount.style.maxHeight = "none";
+    mount.style.overflow = "visible";
+    mount.style.background = "#fff";
+    mount.style.pointerEvents = "none";
+    mount.style.zIndex = "2147483647";
+    mount.innerHTML = htmlDoc;
+    document.body.appendChild(mount);
+
+    try {
+      const imgs = Array.from(mount.querySelectorAll("img"));
+      await Promise.all(
+        imgs.map((img) =>
+          img.complete
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => {
+                img.onload = () => resolve();
+                img.onerror = () => resolve();
+              }),
+        ),
+      );
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+      const jsPDFCtor = jsPdfMod.jsPDF ?? jsPdfMod.default?.jsPDF;
+      const pdf = new jsPDFCtor({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+      const marginMm = 8;
+      const pageWmm = pdf.internal.pageSize.getWidth();
+      const pageHmm = pdf.internal.pageSize.getHeight();
+      const contentWmm = pageWmm - marginMm * 2;
+      const contentHmm = pageHmm - marginMm * 2;
+      const captureWidthPx = 1400;
+      const chunkHeightPx = Math.max(320, Math.floor((contentHmm * captureWidthPx) / contentWmm));
+      const totalHeightPx = Math.max(mount.scrollHeight, 1);
+
+      let firstPage = true;
+      for (let offset = 0; offset < totalHeightPx; offset += chunkHeightPx) {
+        const thisChunk = Math.min(chunkHeightPx, totalHeightPx - offset);
+
+        const frame = document.createElement("div");
+        frame.style.position = "fixed";
+        frame.style.left = "0";
+        frame.style.top = "0";
+        frame.style.width = `${captureWidthPx}px`;
+        frame.style.height = `${thisChunk}px`;
+        frame.style.overflow = "hidden";
+        frame.style.background = "#fff";
+        frame.style.pointerEvents = "none";
+        frame.style.zIndex = "2147483647";
+
+        const shifted = document.createElement("div");
+        shifted.style.transform = `translateY(-${offset}px)`;
+        shifted.style.transformOrigin = "top left";
+        shifted.style.width = `${captureWidthPx}px`;
+        shifted.innerHTML = mount.innerHTML;
+
+        frame.appendChild(shifted);
+        document.body.appendChild(frame);
+        try {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          const canvas = await html2canvas(frame, {
+            scale: 2,
+            useCORS: true,
+            backgroundColor: "#ffffff",
+            logging: false,
+            windowWidth: captureWidthPx,
+            windowHeight: thisChunk,
+          });
+          const imgData = canvas.toDataURL("image/jpeg", 0.95);
+          const drawHmm = (canvas.height * contentWmm) / canvas.width;
+          if (!firstPage) pdf.addPage();
+          pdf.addImage(imgData, "JPEG", marginMm, marginMm, contentWmm, Math.min(drawHmm, contentHmm), undefined, "FAST");
+          firstPage = false;
+        } finally {
+          document.body.removeChild(frame);
+        }
+      }
+
+      const blob: Blob = pdf.output("blob");
+      if (dirHandle) {
+        const fh = await dirHandle.getFileHandle(pdfFilename, { create: true });
+        const w = await fh.createWritable();
+        await w.write(blob);
+        await w.close();
+      } else {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = pdfFilename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }
+    } finally {
+      document.body.removeChild(mount);
+    }
+  }, [inlineMarkdownImages, renderReportHtmlDoc]);
+
   const handleExportReportMd = useCallback(async (targetCtx?: string) => {
     const expId = selectedExpId || "analysis";
     const projId = targetCtx || projectId || (selectedExpId ? mainRaw[selectedExpId]?.project_id : undefined);
@@ -770,17 +1212,41 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       } catch { /* ignore */ }
     }
 
+    const visibleCount = chartFiles.length;
+    const gridCols = visibleCount >= 3 ? 3 : visibleCount >= 2 ? 2 : 1;
+    const imgStyle = `display:block;width:100%;height:auto;${tw ? `max-width:${tw}px;` : ""}${th ? `max-height:${th}px;` : ""}margin:0 auto;`;
+
+    const renderChartGrid = (items: { title: string; filename: string }[]) => {
+      if (items.length === 0) return "";
+      let md = `<table style="width:100%;table-layout:fixed;border-collapse:collapse;">\n`;
+      for (let i = 0; i < items.length; i += gridCols) {
+        const row = items.slice(i, i + gridCols);
+        md += `<tr>`;
+        for (const it of row) {
+          md += `<td style="width:${(100 / gridCols).toFixed(2)}%;vertical-align:top;padding:6px;text-align:center;">`;
+          md += `<div><strong>${it.title}</strong></div><img src="${it.filename}" style="${imgStyle}" />`;
+          md += `</td>`;
+        }
+        if (row.length < gridCols) {
+          for (let j = row.length; j < gridCols; j++) {
+            md += `<td style="width:${(100 / gridCols).toFixed(2)}%;padding:6px;"></td>`;
+          }
+        }
+        md += `</tr>\n`;
+      }
+      md += `</table>\n\n`;
+      return md;
+    };
+
     // Build markdown referencing PNG files by relative filename
     let md = `# Analysis Report\n\n`;
     if (expId !== "analysis") md += `**Experiment:** ${expId}\n\n`;
     md += `## Charts\n\n`;
-    for (const { title, filename } of chartFiles) {
-      md += `### ${title}\n\n`;
-      md += `![${title}](${filename})\n\n`;
-    }
+    md += renderChartGrid(chartFiles.map(({ title, filename }) => ({ title, filename })));
     if (reportText) md += `---\n\n${reportText}`;
 
     const mdFilename = `${expId}_report.md`;
+    const pdfFilename = `${expId}_report.pdf`;
 
     // Get folder handle (prompts if not set)
     const dirHandle = await ensureDirHandle();
@@ -808,7 +1274,13 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       a.download = mdFilename; a.click();
       URL.revokeObjectURL(a.href);
     }
-  }, [projectId, selectedExpId, mainRaw, ensureDirHandle, exportWidth, exportHeight]);
+
+    const imageDataMap = Object.fromEntries(
+      chartFiles.map(({ filename, canvas }) => [filename, canvas.toDataURL("image/png")]),
+    );
+    // Auto-generate PDF from the same report content.
+    await exportPdfFromMarkdown(md, pdfFilename, dirHandle, imageDataMap);
+  }, [projectId, selectedExpId, mainRaw, ensureDirHandle, exportWidth, exportHeight, exportPdfFromMarkdown]);
 
   // ── Batch Report MD: all experiments → charts + project data tables ──────────
   const handleBatchReportMd = useCallback(async () => {
@@ -832,6 +1304,30 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       if (res.ok) reportText = await res.text();
     } catch { /* ignore */ }
 
+    const autoCols = (count: number) => (count >= 3 ? 3 : count >= 2 ? 2 : 1);
+    const imgStyle = `display:block;width:100%;height:auto;${tw ? `max-width:${tw}px;` : ""}${th ? `max-height:${th}px;` : ""}margin:0 auto;`;
+
+    const renderChartGrid = (items: { title: string; filename: string }[]) => {
+      if (items.length === 0) return "";
+      const cols = autoCols(items.length);
+      let md = `<table style="width:100%;table-layout:fixed;border-collapse:collapse;">\n`;
+      for (let i = 0; i < items.length; i += cols) {
+        const row = items.slice(i, i + cols);
+        md += `<tr>`;
+        for (const it of row) {
+          md += `<td style="width:${(100 / cols).toFixed(2)}%;vertical-align:top;padding:6px;text-align:center;">`;
+          md += `<div><strong>${it.title}</strong></div><img src="${it.filename}" style="${imgStyle}" />`;
+          md += `</td>`;
+        }
+        if (row.length < cols) {
+          for (let j = row.length; j < cols; j++) md += `<td style="width:${(100 / cols).toFixed(2)}%;padding:6px;"></td>`;
+        }
+        md += `</tr>\n`;
+      }
+      md += `</table>\n\n`;
+      return md;
+    };
+
     // Batch capture per experiment
     batchCancelRef.current = false;
     setBatchExporting(true);
@@ -839,8 +1335,33 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
     const prevExpId = selectedExpIdRef.current;
     let chartsMd = `## 分析グラフ\n\n`;
     const allChartFiles: { filename: string; canvas: HTMLCanvasElement }[] = [];
+    const projectWideItems = displayItemsRef.current.filter(i => i.visible !== false && i.chartMode === "exp");
+    const perExperimentItems = displayItemsRef.current.filter(i => i.visible !== false && i.chartMode !== "exp");
 
     try {
+      if (projectWideItems.length > 0) {
+        const projectCharts: { title: string; filename: string }[] = [];
+        for (const item of projectWideItems) {
+          const el = panelChartRefs.current.get(item.id);
+          if (!el) continue;
+          try {
+            const raw = await html2canvas(el, {
+              backgroundColor: "#ffffff", scale: 2, useCORS: true, logging: false,
+              ignoreElements: (e) => e.classList.contains("recharts-tooltip-wrapper") || e.classList.contains("recharts-tooltip-cursor"),
+            });
+            const title = item.title || item.id.slice(0, 6);
+            const safe = title.replace(/[^\w\-\.]/g, "_");
+            const filename = `${projectId.slice(0, 8)}_project_${safe}.png`;
+            allChartFiles.push({ filename, canvas: scaleCanvas(raw) });
+            projectCharts.push({ title, filename });
+          } catch (e) { console.error(e); }
+        }
+        if (projectCharts.length) {
+          chartsMd += `### Project-wide (EXP)\n\n`;
+          chartsMd += renderChartGrid(projectCharts);
+        }
+      }
+
       for (let i = 0; i < targets.length; i++) {
         if (batchCancelRef.current) break;
         const entry = targets[i];
@@ -852,8 +1373,8 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
           await new Promise(r => setTimeout(r, 100));
         }
         await new Promise(r => setTimeout(r, 600));
-        chartsMd += `### ${entry.experiment_id}\n\n`;
-        for (const item of displayItemsRef.current.filter(i => i.visible !== false)) {
+        const rowCharts: { title: string; filename: string }[] = [];
+        for (const item of perExperimentItems) {
           const el = panelChartRefs.current.get(item.id);
           if (!el) continue;
           try {
@@ -865,8 +1386,12 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
             const safe = title.replace(/[^\w\-\.]/g, "_");
             const filename = `${entry.experiment_id}_${safe}.png`;
             allChartFiles.push({ filename, canvas: scaleCanvas(raw) });
-            chartsMd += `![${title}](${filename})\n\n`;
+            rowCharts.push({ title, filename });
           } catch (e) { console.error(e); }
+        }
+        if (rowCharts.length) {
+          chartsMd += `### ${entry.experiment_id}\n\n`;
+          chartsMd += renderChartGrid(rowCharts);
         }
       }
     } finally {
@@ -879,6 +1404,7 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
     const projName = projects.find(p => p.project_id === projectId)?.name ?? projectId.slice(0, 8);
     const fullMd = reportText + `\n\n---\n\n` + chartsMd;
     const mdFilename = `${projName}_report.md`;
+    const pdfFilename = `${projName}_report.pdf`;
 
     if (dirHandle) {
       for (const { canvas, filename } of allChartFiles) {
@@ -901,7 +1427,13 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
       a.download = mdFilename; a.click();
       URL.revokeObjectURL(a.href);
     }
-  }, [projectId, ensureDirHandle, exportWidth, exportHeight, projects]);
+
+    const imageDataMap = Object.fromEntries(
+      allChartFiles.map(({ filename, canvas }) => [filename, canvas.toDataURL("image/png")]),
+    );
+    // Auto-generate PDF from the same report content.
+    await exportPdfFromMarkdown(fullMd, pdfFilename, dirHandle, imageDataMap);
+  }, [projectId, ensureDirHandle, exportWidth, exportHeight, projects, exportPdfFromMarkdown]);
 
   // Watch triggerBatchReport prop — run once entries are loaded
   useEffect(() => {
@@ -1108,6 +1640,30 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
                 </MenuItem>
               ))}
             </Menu>
+            {/* Write All to DB */}
+            <Button size="small" variant="outlined" color="success"
+              disabled={writeAllStatus==="writing"}
+              startIcon={writeAllStatus==="writing" ? <CircularProgress size={12} color="inherit"/> : undefined}
+              onClick={e=>setWriteAllMenuAnchor(e.currentTarget)}
+              sx={{ fontSize:11 }}>
+              {writeAllStatus==="ok" ? `Written ✓` : writeAllStatus==="error" ? "Failed ✗" : "Write All to DB"}
+            </Button>
+            <Menu anchorEl={writeAllMenuAnchor} open={!!writeAllMenuAnchor} onClose={()=>setWriteAllMenuAnchor(null)}>
+              <MenuItem dense onClick={()=>{ setWriteAllMenuAnchor(null); handleWriteAllToDb(filteredEntries); }}>
+                All experiments ({filteredEntries.length})
+              </MenuItem>
+              <Divider/>
+              {grouped.map(g=>(
+                <MenuItem dense key={g.key} onClick={()=>{ setWriteAllMenuAnchor(null); handleWriteAllToDb(g.items); }}>
+                  {g.key==="__none__" ? "EXPERIMENTS" : `Project: ${g.label}`} ({g.items.length})
+                </MenuItem>
+              ))}
+            </Menu>
+            {writeAllResult && writeAllStatus!=="idle" && (
+              <Typography fontSize={10} color={writeAllResult.failed>0?"warning.main":"success.main"} sx={{ alignSelf:"center" }}>
+                {writeAllResult.written} written{writeAllResult.skipped>0?`, ${writeAllResult.skipped} skipped`:""}{writeAllResult.failed>0?`, ${writeAllResult.failed} failed`:""}
+              </Typography>
+            )}
           </>
         ) : (
           <>
@@ -1171,6 +1727,8 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
                   onMoveUp={idx>0?()=>moveItem(item.id,-1):undefined}
                   onMoveDown={idx<mainItems.length-1?()=>moveItem(item.id,1):undefined}
                   chartAreaRef={el=>{ if(el) panelChartRefs.current.set(item.id,el); else panelChartRefs.current.delete(item.id); }}
+                  expFlatCache={expFlatCache} allExpEntries={chartEntries}
+                  onWriteAvg={handleWriteAvg}
                 />
               );
             })}
@@ -1194,7 +1752,7 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
             <Button size="small" variant="outlined" color="secondary"
               onClick={()=>handleExportReportMd(g.ctx)}
               sx={{ fontSize:10, py:0.2, px:0.8, minWidth:0 }}>
-              Report MD
+              Report MD+PDF
             </Button>
             <Divider sx={{ flex:1 }}/>
           </Box>
@@ -1219,6 +1777,8 @@ export default function AnalysisTab({ projectId, triggerBatchReport, onBatchRepo
                   onMoveUp={idx>0?()=>moveItem(item.id,-1):undefined}
                   onMoveDown={idx<g.items.length-1?()=>moveItem(item.id,1):undefined}
                   chartAreaRef={el=>{ if(el) panelChartRefs.current.set(item.id,el); else panelChartRefs.current.delete(item.id); }}
+                  expFlatCache={expFlatCache} allExpEntries={chartEntries}
+                  onWriteAvg={handleWriteAvg}
                 />
               );
             })}
@@ -1248,12 +1808,18 @@ interface DisplayItemPanelProps {
   onRefresh: ()=>void;
   onMoveUp?: ()=>void; onMoveDown?: ()=>void;
   chartAreaRef?: (el: HTMLElement|null)=>void;
+  // Exp scatter mode
+  expFlatCache: Record<string, Record<string, number>>;
+  allExpEntries: ExpEntry[];
+  // Write avg values to result
+  onWriteAvg?: (fields: Record<string, number>) => Promise<void>;
 }
 
 function DisplayItemPanel({
   item, index, pathCols, selectedEntry, resolvedFile, availHeaders,
   rows, isLoadingFile, hasError, saving, accentColor, onUpdate, onRemove, onSave, onRefresh,
   onMoveUp, onMoveDown, chartAreaRef,
+  expFlatCache, allExpEntries, onWriteAvg,
 }: DisplayItemPanelProps) {
   // Local draft -- all edit-panel changes live here until Save
   const [draft, setDraft] = useState<DisplayItem>(()=>({...item}));
@@ -1291,6 +1857,9 @@ function DisplayItemPanel({
   useEffect(()=>setLocalDs(draft.downsample), [draft.downsample]);
   useEffect(()=>setLocalXL(draft.xLabel),     [draft.xLabel]);
   useEffect(()=>setLocalYL(draft.yLabel),     [draft.yLabel]);
+
+  // Write-to-DB state
+  const [writeStatus, setWriteStatus] = useState<Record<string, "idle"|"writing"|"ok"|"error">>({}); 
 
   const effectiveX = (draft.xCol&&availHeaders.includes(draft.xCol))?draft.xCol:"";
   const effectiveY = draft.yCols.filter(y=>availHeaders.includes(y));
@@ -1388,8 +1957,10 @@ function DisplayItemPanel({
         const i = effectiveY.indexOf(col);
         const color = isPf ? (pfColorMap[col] ?? "#888") : getSeriesStyle(draft.seriesStyles, col, i).color;
         const colLabel = isPf ? (pfLabelMap[col] ?? col) : col;
-        const sum = inRange.reduce((s, r) => s + ((r[col] as number) ?? 0), 0);
-        result.push({ rangeId: ar.id, rangeLabel: ar.label, col, colLabel, val: sum / inRange.length, color });
+        const vals = inRange.map(r => r[col] as number).filter(v => isFinite(v));
+        if (vals.length === 0) continue;
+        const val = vals.reduce((s, v) => s + v, 0) / vals.length;
+        result.push({ rangeId: ar.id, rangeLabel: ar.label, col, colLabel, val, color });
       }
     }
     return result;
@@ -1449,6 +2020,45 @@ function DisplayItemPanel({
   const ready2D   = fileReady&&draft.chartMode==="2d"&&!!effectiveX&&effectiveY.length>0;
   const ready3D   = fileReady&&draft.chartMode==="3d"&&!!effectiveX&&effectiveY.length>0&&!!effectiveZ;
   const readyDist = fileReady&&draft.chartMode==="dist"&&!!effectiveX&&effectiveY.length>0;
+
+  // ── Exp scatter mode ──────────────────────────────────────────────────────
+  // All entries belonging to this chart context
+  const expContextEntries = useMemo(() => {
+    const ctx = item.chartContext ?? "main";
+    return allExpEntries.filter(e => ctx === "main" ? e.source === "main" : e.source === ctx);
+  }, [allExpEntries, item.chartContext]);
+
+  // Available flat keys (union of all loaded experiments in this context)
+  const expAvailCols = useMemo<string[]>(() => {
+    const keySet = new Set<string>();
+    for (const e of expContextEntries) {
+      const flat = expFlatCache[e.experiment_id];
+      if (flat) Object.keys(flat).forEach(k => keySet.add(k));
+    }
+    return Array.from(keySet).sort();
+  }, [expContextEntries, expFlatCache]);
+
+  // Scatter data: one series per Y col
+  const expScatterSeries = useMemo(() => {
+    if (draft.chartMode !== "exp" || !draft.xCol || draft.yCols.length === 0) return [];
+    return draft.yCols.map((yCol, seriesIdx) => ({
+      yCol,
+      color: getSeriesStyle(draft.seriesStyles, yCol, seriesIdx).color,
+      points: expContextEntries
+        .filter(e => expFlatCache[e.experiment_id])
+        .map(e => {
+          const flat = expFlatCache[e.experiment_id];
+          const x = flat[draft.xCol];
+          const y = flat[yCol];
+          if (x === undefined || y === undefined) return null;
+          return { x, y, name: e.remarks ?? e.experiment_id.slice(0, 8) };
+        })
+        .filter((p): p is { x: number; y: number; name: string } => p !== null),
+    }));
+  }, [draft.chartMode, draft.xCol, draft.yCols, draft.seriesStyles, expContextEntries, expFlatCache]);
+
+  const expLoading = draft.chartMode === "exp" && expContextEntries.some(e => !expFlatCache[e.experiment_id]);
+  const readyExp = draft.chartMode === "exp" && !!draft.xCol && draft.yCols.length > 0 && expScatterSeries.some(s => s.points.length > 0);
 
   // Distribution heatmap data
   const distData = useMemo(()=>{
@@ -1555,23 +2165,35 @@ function DisplayItemPanel({
 
             {/* Path + mode + BG */}
             <Box sx={{ display:"flex", gap:1.5, flexWrap:"wrap", alignItems:"center" }}>
-              <FormControl size="small" sx={{ minWidth:240 }}>
-                <InputLabel sx={{ fontSize:12 }}>File path column</InputLabel>
-                <Select label="File path column" value={draft.pathCol}
-                  onChange={e=>draftUpdate({pathCol:e.target.value})} sx={{ fontSize:12 }}>
-                  <MenuItem value=""><em>Select\u2026</em></MenuItem>
-                  {pathCols.map(c=>{const{table,col}=parsePathCol(c);return<MenuItem key={c} value={c} sx={{fontSize:12}}>{table}: {col}</MenuItem>;})}
-                </Select>
-              </FormControl>
-              {resolvedFile&&<Chip label={resolvedFile} size="small" sx={{ fontSize:10 }}/>}
-              {draft.pathCol&&selectedEntry&&!resolvedFile&&!isLoadingFile&&(
-                <Typography fontSize={11} color="warning.main">Path not set</Typography>
+              {draft.chartMode !== "exp" && (
+                <>
+                  <FormControl size="small" sx={{ minWidth:240 }}>
+                    <InputLabel sx={{ fontSize:12 }}>File path column</InputLabel>
+                    <Select label="File path column" value={draft.pathCol}
+                      onChange={e=>draftUpdate({pathCol:e.target.value})} sx={{ fontSize:12 }}>
+                      <MenuItem value=""><em>Select…</em></MenuItem>
+                      {pathCols.map(c=>{const{table,col}=parsePathCol(c);return<MenuItem key={c} value={c} sx={{fontSize:12}}>{table}: {col}</MenuItem>;})}
+                    </Select>
+                  </FormControl>
+                  {resolvedFile&&<Chip label={resolvedFile} size="small" sx={{ fontSize:10 }}/>}
+                  {draft.pathCol&&selectedEntry&&!resolvedFile&&!isLoadingFile&&(
+                    <Typography fontSize={11} color="warning.main">Path not set</Typography>
+                  )}
+                </>
+              )}
+              {draft.chartMode === "exp" && (
+                <Typography fontSize={12} color="secondary.main" fontWeight="bold">
+                  Experiment Scatter — {expContextEntries.length} experiments
+                  {expLoading && <span style={{ marginLeft:8, opacity:0.7 }}>Loading…</span>}
+                </Typography>
               )}
               <Box sx={{ display:"flex", alignItems:"center", gap:0.5 }}>
                 <Typography fontSize={12} color="text.secondary">Mode:</Typography>
-                {(["2d","3d","dist"] as ChartMode[]).map(m=>(
+                {(["2d","3d","dist","exp"] as ChartMode[]).map(m=>(
                   <Button key={m} size="small" variant={draft.chartMode===m?"contained":"outlined"}
-                    onClick={()=>draftUpdate({chartMode:m})} sx={{ fontSize:11, minWidth:38, py:0.2 }}
+                    onClick={()=>draftUpdate({chartMode:m})}
+                    color={m==="exp"?"secondary":"primary"}
+                    sx={{ fontSize:11, minWidth:38, py:0.2 }}
                   >{m.toUpperCase()}</Button>
                 ))}
               </Box>
@@ -1589,8 +2211,8 @@ function DisplayItemPanel({
               />
             </Box>
 
-            {/* Axis selectors */}
-            {availHeaders.length>0 && (
+            {/* Axis selectors — file mode (2d/3d/dist) */}
+            {draft.chartMode !== "exp" && availHeaders.length>0 && (
               <Box sx={{ display:"flex", flexDirection:"column", gap:0.8 }}>
                 {/* X */}
                 <Box>
@@ -1804,6 +2426,80 @@ function DisplayItemPanel({
               </Box>
             </Box>
 
+            {/* Exp scatter axis selectors */}
+            {draft.chartMode === "exp" && (
+              <Box sx={{ display:"flex", flexDirection:"column", gap:0.8 }}>
+                {expLoading && <Typography fontSize={11} color="text.secondary">Loading columns…</Typography>}
+                {!expLoading && expAvailCols.length === 0 && (
+                  <Typography fontSize={11} color="warning.main">No numeric columns found (int/float)</Typography>
+                )}
+                {/* X axis — dropdown */}
+                <Box sx={{ display:"flex", alignItems:"center", gap:1 }}>
+                  <Typography fontSize={12} color="text.secondary" sx={{ minWidth:46 }}>X axis</Typography>
+                  <FormControl size="small" sx={{ minWidth:240 }}>
+                    <InputLabel sx={{ fontSize:12 }}>Column (numeric)</InputLabel>
+                    <Select label="Column (numeric)" value={draft.xCol}
+                      onChange={e=>{const p={xCol:e.target.value as string,yCols:draft.yCols.filter(y=>y!==e.target.value)};onUpdate(p);draftUpdate(p);}}
+                      sx={{ fontSize:12 }}>
+                      <MenuItem value=""><em>Select…</em></MenuItem>
+                      {expAvailCols.map(h=><MenuItem key={h} value={h} sx={{fontSize:12}}>{h}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                </Box>
+                {/* Y axis — dropdown to add + list of selected */}
+                <Box>
+                  <Box sx={{ display:"flex", alignItems:"center", gap:1, mb:0.5 }}>
+                    <Typography fontSize={12} color="text.secondary" sx={{ minWidth:46 }}>Y axis</Typography>
+                    <FormControl size="small" sx={{ minWidth:240 }}>
+                      <InputLabel sx={{ fontSize:12 }}>Add column…</InputLabel>
+                      <Select label="Add column…" value=""
+                        onChange={e=>{
+                          const h=e.target.value as string;
+                          if(!h||draft.yCols.includes(h)) return;
+                          const yCols=[...draft.yCols,h]; onUpdate({yCols}); draftUpdate({yCols});
+                        }}
+                        sx={{ fontSize:12 }}>
+                        <MenuItem value=""><em>Select to add…</em></MenuItem>
+                        {expAvailCols.filter(h=>h!==draft.xCol&&!draft.yCols.includes(h)).map(h=>(
+                          <MenuItem key={h} value={h} sx={{fontSize:12}}>{h}</MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                  </Box>
+                  {draft.yCols.length > 0 && (
+                    <Box sx={{ display:"flex", flexDirection:"column", gap:0.3, ml:7 }}>
+                      {draft.yCols.map((col, i) => (
+                        <Box key={col} sx={{ display:"flex", alignItems:"center", gap:0.5,
+                          bgcolor:"primary.50", border:"1px solid", borderColor:"primary.200",
+                          borderRadius:0.5, px:0.5, py:0.2, maxWidth:320 }}>
+                          <Box sx={{ width:12, height:12, borderRadius:"50%", flexShrink:0,
+                            bgcolor: getSeriesStyle(draft.seriesStyles, col, i).color }}/>
+                          <Typography fontSize={11} sx={{ flex:1 }}>{col}</Typography>
+                          <IconButton size="small" color="error" sx={{ p:0.2 }}
+                            onClick={()=>{const p={yCols:draft.yCols.filter(y=>y!==col)};onUpdate(p);draftUpdate(p);}}>
+                            <DeleteIcon sx={{ fontSize:13 }}/>
+                          </IconButton>
+                        </Box>
+                      ))}
+                    </Box>
+                  )}
+                </Box>
+                {/* Axis labels */}
+                <Box sx={{ display:"flex", gap:1, flexWrap:"wrap", alignItems:"center" }}>
+                  <Typography fontSize={11} color="text.secondary">X Label</Typography>
+                  <TextField size="small" value={localXL} placeholder={draft.xCol||"X"}
+                    onChange={e=>setLocalXL(e.target.value)} onBlur={()=>draftUpdate({xLabel:localXL})}
+                    onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({xLabel:localXL});(e.target as HTMLInputElement).blur();}}}
+                    inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                  <Typography fontSize={11} color="text.secondary">Y Label</Typography>
+                  <TextField size="small" value={localYL} placeholder={draft.yCols.join(",")||"Y"}
+                    onChange={e=>setLocalYL(e.target.value)} onBlur={()=>draftUpdate({yLabel:localYL})}
+                    onKeyDown={e=>{if(e.key==="Enter"){draftUpdate({yLabel:localYL});(e.target as HTMLInputElement).blur();}}}
+                    inputProps={{ style:{fontSize:11,width:90} }} sx={{ width:112 }}/>
+                </Box>
+              </Box>
+            )}
+
             {/* Per-series style */}
             {draft.yCols.length>0&&availHeaders.length>0&&(
               <Box>
@@ -1910,7 +2606,8 @@ function DisplayItemPanel({
                   <IconButton size="small" color="primary"
                     onClick={()=>{
                       const newAr: AvgRangeConfig = { id: crypto.randomUUID(), xMin:"", xMax:"", yCols:[], label:"" };
-                      draftUpdate({ avgRanges: [...(draft.avgRanges??[]), newAr] });
+                      const na = [...(draft.avgRanges??[]), newAr];
+                      draftUpdate({ avgRanges: na }); onUpdate({ avgRanges: na });
                     }}>
                     <AddIcon fontSize="small"/>
                   </IconButton>
@@ -1924,16 +2621,16 @@ function DisplayItemPanel({
                       {/* Row 1: label + x range + delete */}
                       <Box sx={{ display:"flex", gap:0.5, alignItems:"center", flexWrap:"wrap" }}>
                         <TextField size="small" placeholder="label" value={ar.label}
-                          onChange={e=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,label:e.target.value}; draftUpdate({avgRanges:n}); }}
+                          onChange={e=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,label:e.target.value}; draftUpdate({avgRanges:n}); onUpdate({avgRanges:n}); }}
                           inputProps={{ style:{fontSize:11,width:80} }} sx={{ width:100 }}/>
                         <Typography fontSize={11} color="text.secondary">X:</Typography>
                         <NumInput value={ar.xMin} width={60} placeholder="min"
-                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMin:v}; draftUpdate({avgRanges:n}); }}/>
+                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMin:v}; draftUpdate({avgRanges:n}); onUpdate({avgRanges:n}); }}/>
                         <Typography fontSize={11}>～</Typography>
                         <NumInput value={ar.xMax} width={60} placeholder="max"
-                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMax:v}; draftUpdate({avgRanges:n}); }}/>
+                          onChange={v=>{ const n=[...(draft.avgRanges??[])]; n[ai]={...ar,xMax:v}; draftUpdate({avgRanges:n}); onUpdate({avgRanges:n}); }}/>
                         <IconButton size="small" color="error"
-                          onClick={()=>draftUpdate({avgRanges:(draft.avgRanges??[]).filter((_,k)=>k!==ai)})}>
+                          onClick={()=>{ const nr=(draft.avgRanges??[]).filter((_,k)=>k!==ai); draftUpdate({avgRanges:nr}); onUpdate({avgRanges:nr}); }}>
                           <DeleteIcon fontSize="small"/>
                         </IconButton>
                       </Box>
@@ -1945,7 +2642,7 @@ function DisplayItemPanel({
                             control={<Checkbox size="small" sx={{ py:0.1 }} checked={ar.yCols.includes(col)}
                               onChange={e=>{
                                 const nc = e.target.checked ? [...ar.yCols,col] : ar.yCols.filter(c=>c!==col);
-                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n});
+                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n}); onUpdate({avgRanges:n});
                               }}/>}
                             label={<Typography fontSize={10}>{col}</Typography>} sx={{ mr:0.3 }}
                           />
@@ -1955,21 +2652,81 @@ function DisplayItemPanel({
                             control={<Checkbox size="small" sx={{ py:0.1 }} checked={ar.yCols.includes(pf.id)}
                               onChange={e=>{
                                 const nc = e.target.checked ? [...ar.yCols,pf.id] : ar.yCols.filter(c=>c!==pf.id);
-                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n});
+                                const n=[...(draft.avgRanges??[])]; n[ai]={...ar,yCols:nc}; draftUpdate({avgRanges:n}); onUpdate({avgRanges:n});
                               }}/>}
                             label={<Typography fontSize={10} sx={{color:"primary.main"}}>{pf.label||`${pf.yCol}_pf`}</Typography>} sx={{ mr:0.3 }}
                           />
                         ))}
                       </Box>
-                      {/* Row 3: computed avg chips */}
+                      {/* Row 3: computed avg chips + field mapping + write button */}
                       {arAvg.length>0 && (
-                        <Box sx={{ display:"flex", gap:0.5, flexWrap:"wrap" }}>
-                          {arAvg.map(({col,colLabel,val,color})=>(
-                            <Chip key={col} size="small"
-                              label={`${ar.label?ar.label+" ":""}avg ${colLabel}: ${val.toFixed(4)}`}
-                              sx={{ fontSize:10, bgcolor:color+"22", borderColor:color, border:"1px solid" }}
-                            />
-                          ))}
+                        <Box sx={{ display:"flex", flexDirection:"column", gap:0.5 }}>
+                          {arAvg.map(({col,colLabel,val,color})=>{
+                            const mappedField = ar.fieldMap?.[col] ?? "";
+                            return (
+                              <Box key={col} sx={{ display:"flex", alignItems:"center", gap:0.5, flexWrap:"wrap" }}>
+                                <Chip size="small"
+                                  label={`${ar.label?ar.label+" ":""}avg ${colLabel}: ${val.toFixed(4)}`}
+                                  sx={{ fontSize:10, bgcolor:color+"22", borderColor:color, border:"1px solid" }}
+                                />
+                                <Typography fontSize={10} color="text.secondary">→</Typography>
+                                <FormControl size="small" sx={{ minWidth:180 }}>
+                                  <Select displayEmpty value={mappedField}
+                                    onChange={e=>{
+                                      const n=[...(draft.avgRanges??[])]; 
+                                      n[ai]={...ar,fieldMap:{...(ar.fieldMap??{}), [col]: e.target.value as string}};
+                                      draftUpdate({avgRanges:n}); onUpdate({avgRanges:n});
+                                    }}
+                                    sx={{ fontSize:11 }} inputProps={{ sx:{py:0.4,fontSize:11} }}>
+                                    <MenuItem value="" sx={{fontSize:11}}><em>— not mapped —</em></MenuItem>
+                                    <MenuItem value="oct_depth_mm" sx={{fontSize:11}}>oct_depth_mm</MenuItem>
+                                    <MenuItem value="cross_section_depth_mm" sx={{fontSize:11}}>cross_section_depth_mm</MenuItem>
+                                    <MenuItem value="spatter_severity" sx={{fontSize:11}}>spatter_severity</MenuItem>
+                                    <MenuItem value="crack_severity" sx={{fontSize:11}}>crack_severity</MenuItem>
+                                  </Select>
+                                </FormControl>
+                              </Box>
+                            );
+                          })}
+                          {/* Write current experiment button */}
+                          {onWriteAvg && Object.values(ar.fieldMap??{}).some(f=>f) && (
+                            <Box sx={{ display:"flex", alignItems:"center", gap:1, flexWrap:"wrap" }}>
+                              <Button size="small" variant="contained" color="success"
+                                disabled={writeStatus[ar.id]==="writing"}
+                                startIcon={writeStatus[ar.id]==="writing"
+                                  ? <CircularProgress size={12} color="inherit"/>
+                                  : writeStatus[ar.id]==="ok" ? <span style={{fontSize:12}}>✓</span>
+                                  : writeStatus[ar.id]==="error" ? <span style={{fontSize:12}}>✗</span>
+                                  : undefined}
+                                sx={{ fontSize:11, py:0.3 }}
+                                onClick={async()=>{
+                                  const fields: Record<string,number> = {};
+                                  arAvg.forEach(({col,val})=>{ const f=ar.fieldMap?.[col]; if(f && isFinite(val)) fields[f]=val; });
+                                  if (!Object.keys(fields).length) {
+                                    setWriteStatus(prev=>({...prev,[ar.id]:"error"}));
+                                    setTimeout(()=>setWriteStatus(prev=>({...prev,[ar.id]:"idle"})), 3000);
+                                    return;
+                                  }
+                                  setWriteStatus(prev=>({...prev,[ar.id]:"writing"}));
+                                  try {
+                                    await onWriteAvg(fields);
+                                    setWriteStatus(prev=>({...prev,[ar.id]:"ok"}));
+                                    setTimeout(()=>setWriteStatus(prev=>({...prev,[ar.id]:"idle"})), 3000);
+                                  } catch {
+                                    setWriteStatus(prev=>({...prev,[ar.id]:"error"}));
+                                    setTimeout(()=>setWriteStatus(prev=>({...prev,[ar.id]:"idle"})), 4000);
+                                  }
+                                }}>
+                                {writeStatus[ar.id]==="ok" ? "Written!" : writeStatus[ar.id]==="error" ? "Failed" : "Write to DB"}
+                              </Button>
+                              <Typography fontSize={10} color="text.secondary">
+                                {Object.entries(ar.fieldMap??{}).filter(([,f])=>f).map(([c,f])=>{
+                                  const v=arAvg.find(a=>a.col===c)?.val;
+                                  return v!==undefined ? `${f}=${v.toFixed(4)}` : null;
+                                }).filter(Boolean).join(", ")}
+                              </Typography>
+                            </Box>
+                          )}
                         </Box>
                       )}
                     </Box>
@@ -1982,8 +2739,46 @@ function DisplayItemPanel({
 
         {/* ── Chart area ── */}
         <Box ref={chartAreaRef} sx={{ p:1 }}>
-          {!draft.pathCol ? (
-            <Hint>[\u2261] Open Edit \u2192 select a file path column</Hint>
+          {draft.chartMode === "exp" ? (
+            expLoading && expScatterSeries.every(s=>s.points.length===0) ? (
+              <Box sx={{ height:80, display:"flex", alignItems:"center", justifyContent:"center", gap:1 }}>
+                <CircularProgress size={18}/><Typography fontSize={12} color="text.secondary">Loading experiments…</Typography>
+              </Box>
+            ) : !readyExp ? (
+              <Hint>[≡] Open Edit → select X and Y columns</Hint>
+            ) : (
+              <Box ref={chartAreaRef} sx={{ bgcolor:draft.chartBgColor, borderRadius:1, p:1, overflow:"hidden" }}>
+                <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
+                  <ScatterChart margin={{ top:8, right:20, bottom:36, left:10 }}>
+                    <CartesianGrid strokeDasharray="3 3" opacity={0.25}/>
+                    <XAxis type="number" dataKey="x" name={draft.xLabel||draft.xCol} tick={{ fontSize:10 }}
+                      label={{ value:draft.xLabel||draft.xCol, position:"insideBottom", offset:-18, fontSize:11 }}/>
+                    <YAxis type="number" dataKey="y" name={draft.yLabel||draft.yCols.join(",")} tick={{ fontSize:10 }} width={60}
+                      label={draft.yLabel?{ value:draft.yLabel, angle:-90, position:"insideLeft", fontSize:11, offset:10 }:undefined}/>
+                    <ZAxis range={[40, 40]}/>
+                    <ChartTooltip cursor={{ strokeDasharray:"3 3" }} contentStyle={{ fontSize:11 }}
+                      content={({ payload }) => {
+                        if (!payload?.length) return null;
+                        const d = payload[0].payload as { x: number; y: number; name: string };
+                        return (
+                          <Box sx={{ bgcolor:"background.paper", border:"1px solid", borderColor:"divider", p:0.8, borderRadius:0.5, fontSize:11 }}>
+                            <div style={{ fontWeight:600, marginBottom:2 }}>{d.name}</div>
+                            <div>{draft.xLabel||draft.xCol}: {typeof d.x==="number"?d.x.toFixed(4):d.x}</div>
+                            <div>{payload[0].name}: {typeof d.y==="number"?d.y.toFixed(4):d.y}</div>
+                          </Box>
+                        );
+                      }}
+                    />
+                    {draft.showLegend !== false && <Legend verticalAlign="top" height={26} wrapperStyle={{ fontSize:11 }}/>}
+                    {expScatterSeries.map(({ yCol, color, points }) => (
+                      <Scatter key={yCol} name={yCol} data={points} fill={color} opacity={0.8}/>
+                    ))}
+                  </ScatterChart>
+                </ResponsiveContainer>
+              </Box>
+            )
+          ) : !draft.pathCol ? (
+            <Hint>[≡] Open Edit → select a file path column</Hint>
           ) : !selectedEntry ? (
             <Hint>Select an experiment above</Hint>
           ) : hasError ? (
@@ -2111,6 +2906,44 @@ function DisplayItemPanel({
                   maxPct={distData.maxPct} bgColor={draft.chartBgColor}
                   cmapMin={parseNum(draft.distCmapMin)} cmapMax={parseNum(draft.distCmapMax)}
                 />
+              </Box>
+            )
+          ) : draft.chartMode==="exp" ? (
+            expLoading && expScatterSeries.every(s=>s.points.length===0) ? (
+              <Box sx={{ height:80, display:"flex", alignItems:"center", justifyContent:"center", gap:1 }}>
+                <CircularProgress size={18}/><Typography fontSize={12} color="text.secondary">Loading experiments…</Typography>
+              </Box>
+            ) : !readyExp ? (
+              <Hint>[≡] Open Edit → select X and Y columns</Hint>
+            ) : (
+              <Box sx={{ bgcolor:draft.chartBgColor, borderRadius:1, p:1, overflow:"hidden" }}>
+                <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
+                  <ScatterChart margin={{ top:8, right:20, bottom:36, left:10 }}>
+                    <CartesianGrid strokeDasharray="3 3" opacity={0.25}/>
+                    <XAxis type="number" dataKey="x" name={draft.xLabel||draft.xCol} tick={{ fontSize:10 }}
+                      label={{ value:draft.xLabel||draft.xCol, position:"insideBottom", offset:-18, fontSize:11 }}/>
+                    <YAxis type="number" dataKey="y" name={draft.yLabel||draft.yCols.join(",")} tick={{ fontSize:10 }} width={60}
+                      label={draft.yLabel?{ value:draft.yLabel, angle:-90, position:"insideLeft", fontSize:11, offset:10 }:undefined}/>
+                    <ZAxis range={[40, 40]}/>
+                    <ChartTooltip cursor={{ strokeDasharray:"3 3" }} contentStyle={{ fontSize:11 }}
+                      content={({ payload }) => {
+                        if (!payload?.length) return null;
+                        const d = payload[0].payload as { x: number; y: number; name: string };
+                        return (
+                          <Box sx={{ bgcolor:"background.paper", border:"1px solid", borderColor:"divider", p:0.8, borderRadius:0.5, fontSize:11 }}>
+                            <div style={{ fontWeight:600, marginBottom:2 }}>{d.name}</div>
+                            <div>{draft.xLabel||draft.xCol}: {typeof d.x==="number"?d.x.toFixed(4):d.x}</div>
+                            <div>{payload[0].name}: {typeof d.y==="number"?d.y.toFixed(4):d.y}</div>
+                          </Box>
+                        );
+                      }}
+                    />
+                    {draft.showLegend !== false && <Legend verticalAlign="top" height={26} wrapperStyle={{ fontSize:11 }}/>}
+                    {expScatterSeries.map(({ yCol, color, points }) => (
+                      <Scatter key={yCol} name={yCol} data={points} fill={color} opacity={0.8}/>
+                    ))}
+                  </ScatterChart>
+                </ResponsiveContainer>
               </Box>
             )
           ) : (

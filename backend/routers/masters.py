@@ -10,7 +10,10 @@ from backend.models import (
     LaserDevice,
     Ftheta, Optics, Doe,
     GalvanoSystem,
-    LineParameter, MainTrajectory, WobblingParameter, SubTrajectory, TrajectorySet,
+    LineParameter, CircleParameter, SpiralParameter,
+    MainTrajectory,
+    WobblingParameter, EightParameter, RasterParameter,
+    SubTrajectory, TrajectorySet,
     WeldingCondition, ShieldingCondition,
     Result, Observation,
     ExperimentMaterial, File, Experiment,
@@ -64,6 +67,25 @@ def _delete_one(model, pk, pk_val, db):
         raise HTTPException(status_code=404, detail="Not found")
     db.delete(item)
     db.commit()
+
+
+def _dyn_param_models() -> dict[str, tuple[type, str]]:
+    return {
+        "circle_parameter": (CircleParameter, "main_trajectory_type_parameter_id"),
+        "line_parameter": (LineParameter, "main_trajectory_type_parameter_id"),
+        "spiral_parameter": (SpiralParameter, "main_trajectory_type_parameter_id"),
+        "eight_parameter": (EightParameter, "sub_trajectory_type_parameter_id"),
+        "raster_parameter": (RasterParameter, "sub_trajectory_type_parameter_id"),
+        "wobbling_parameter": (WobblingParameter, "sub_trajectory_type_parameter_id"),
+    }
+
+
+def _resolve_dyn_param(slug: str) -> tuple[type, str]:
+    table_name = slug.replace("-", "_").lower()
+    entry = _dyn_param_models().get(table_name)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Not found")
+    return entry
 
 
 # ── Material ──────────────────────────────────────────────────────────────────
@@ -445,6 +467,52 @@ def delete_line_parameter(item_id: str, db: Session = Depends(get_db)):
     _delete_one(LineParameter, "main_trajectory_type_parameter_id", item_id, db)
 
 
+# ── CircleParameter ─────────────────────────────────────────────────────────────
+
+@router.get("/circle-parameters")
+def list_circle_parameters(db: Session = Depends(get_db)):
+    return _list_all(CircleParameter, db)
+
+@router.get("/circle-parameters/{item_id}")
+def get_circle_parameter(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(CircleParameter, "main_trajectory_type_parameter_id", item_id, db)
+
+@router.post("/circle-parameters", status_code=201)
+def create_circle_parameter(body: dict = Body(...), db: Session = Depends(get_db)):
+    return _create_one(CircleParameter, "main_trajectory_type_parameter_id", body, db)
+
+@router.put("/circle-parameters/{item_id}")
+def update_circle_parameter(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    return _update_one(CircleParameter, "main_trajectory_type_parameter_id", item_id, body, db)
+
+@router.delete("/circle-parameters/{item_id}", status_code=204)
+def delete_circle_parameter(item_id: str, db: Session = Depends(get_db)):
+    _delete_one(CircleParameter, "main_trajectory_type_parameter_id", item_id, db)
+
+
+# ── SpiralParameter ─────────────────────────────────────────────────────────────
+
+@router.get("/spiral-parameters")
+def list_spiral_parameters(db: Session = Depends(get_db)):
+    return _list_all(SpiralParameter, db)
+
+@router.get("/spiral-parameters/{item_id}")
+def get_spiral_parameter(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(SpiralParameter, "main_trajectory_type_parameter_id", item_id, db)
+
+@router.post("/spiral-parameters", status_code=201)
+def create_spiral_parameter(body: dict = Body(...), db: Session = Depends(get_db)):
+    return _create_one(SpiralParameter, "main_trajectory_type_parameter_id", body, db)
+
+@router.put("/spiral-parameters/{item_id}")
+def update_spiral_parameter(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    return _update_one(SpiralParameter, "main_trajectory_type_parameter_id", item_id, body, db)
+
+@router.delete("/spiral-parameters/{item_id}", status_code=204)
+def delete_spiral_parameter(item_id: str, db: Session = Depends(get_db)):
+    _delete_one(SpiralParameter, "main_trajectory_type_parameter_id", item_id, db)
+
+
 # ── MainTrajectory ──────────────────────────────────────────────────────────────
 
 @router.get("/main-trajectories")
@@ -489,6 +557,52 @@ def update_wobbling_parameter(item_id: str, body: dict = Body(...), db: Session 
 @router.delete("/wobbling-parameters/{item_id}", status_code=204)
 def delete_wobbling_parameter(item_id: str, db: Session = Depends(get_db)):
     _delete_one(WobblingParameter, "sub_trajectory_type_parameter_id", item_id, db)
+
+
+# ── EightParameter ───────────────────────────────────────────────────────────────
+
+@router.get("/eight-parameters")
+def list_eight_parameters(db: Session = Depends(get_db)):
+    return _list_all(EightParameter, db)
+
+@router.get("/eight-parameters/{item_id}")
+def get_eight_parameter(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(EightParameter, "sub_trajectory_type_parameter_id", item_id, db)
+
+@router.post("/eight-parameters", status_code=201)
+def create_eight_parameter(body: dict = Body(...), db: Session = Depends(get_db)):
+    return _create_one(EightParameter, "sub_trajectory_type_parameter_id", body, db)
+
+@router.put("/eight-parameters/{item_id}")
+def update_eight_parameter(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    return _update_one(EightParameter, "sub_trajectory_type_parameter_id", item_id, body, db)
+
+@router.delete("/eight-parameters/{item_id}", status_code=204)
+def delete_eight_parameter(item_id: str, db: Session = Depends(get_db)):
+    _delete_one(EightParameter, "sub_trajectory_type_parameter_id", item_id, db)
+
+
+# ── RasterParameter ──────────────────────────────────────────────────────────────
+
+@router.get("/raster-parameters")
+def list_raster_parameters(db: Session = Depends(get_db)):
+    return _list_all(RasterParameter, db)
+
+@router.get("/raster-parameters/{item_id}")
+def get_raster_parameter(item_id: str, db: Session = Depends(get_db)):
+    return _get_one(RasterParameter, "sub_trajectory_type_parameter_id", item_id, db)
+
+@router.post("/raster-parameters", status_code=201)
+def create_raster_parameter(body: dict = Body(...), db: Session = Depends(get_db)):
+    return _create_one(RasterParameter, "sub_trajectory_type_parameter_id", body, db)
+
+@router.put("/raster-parameters/{item_id}")
+def update_raster_parameter(item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    return _update_one(RasterParameter, "sub_trajectory_type_parameter_id", item_id, body, db)
+
+@router.delete("/raster-parameters/{item_id}", status_code=204)
+def delete_raster_parameter(item_id: str, db: Session = Depends(get_db)):
+    _delete_one(RasterParameter, "sub_trajectory_type_parameter_id", item_id, db)
 
 
 # ── SubTrajectory ───────────────────────────────────────────────────────────────
@@ -730,14 +844,49 @@ def delete_experiment(item_id: str, db: Session = Depends(get_db)):
 
 @router.get("/trajectory-type-defs")
 def list_trajectory_type_defs():
-    """動的トラジェクトリパラメータタブ定義の一覧（現在は未使用・空リストを返す）"""
-    return []
+    """ER図に合わせた動的トラジェクトリパラメータタブ定義の一覧。"""
+    return [
+        {"trajectory_type_def_id": "circle_parameter",   "type_name": "circle",   "param_table": "circle_parameter",   "parent": "main", "pk_col": "main_trajectory_type_parameter_id"},
+        {"trajectory_type_def_id": "line_parameter",     "type_name": "line",     "param_table": "line_parameter",     "parent": "main", "pk_col": "main_trajectory_type_parameter_id"},
+        {"trajectory_type_def_id": "spiral_parameter",   "type_name": "spiral",   "param_table": "spiral_parameter",   "parent": "main", "pk_col": "main_trajectory_type_parameter_id"},
+        {"trajectory_type_def_id": "eight_parameter",    "type_name": "eight",    "param_table": "eight_parameter",    "parent": "sub",  "pk_col": "sub_trajectory_type_parameter_id"},
+        {"trajectory_type_def_id": "raster_parameter",   "type_name": "raster",   "param_table": "raster_parameter",   "parent": "sub",  "pk_col": "sub_trajectory_type_parameter_id"},
+        {"trajectory_type_def_id": "wobbling_parameter", "type_name": "wobbling", "param_table": "wobbling_parameter", "parent": "sub",  "pk_col": "sub_trajectory_type_parameter_id"},
+    ]
 
 
 @router.post("/trajectory-type-defs/sync")
 def sync_trajectory_type_defs():
-    """trajectory-type-defs の同期（スタブ）"""
-    return {"synced": 0}
+    """trajectory-type-defs の同期（ER図ベースの静的定義を返す）"""
+    return {"synced": len(list_trajectory_type_defs())}
+
+
+# ── Dynamic trajectory parameter tables ──────────────────────────────────────────
+
+@router.get("/dyn-params/{slug}")
+def list_dyn_params(slug: str, db: Session = Depends(get_db)):
+    model, _ = _resolve_dyn_param(slug)
+    return _list_all(model, db)
+
+@router.get("/dyn-params/{slug}/{item_id}")
+def get_dyn_param(slug: str, item_id: str, db: Session = Depends(get_db)):
+    model, pk = _resolve_dyn_param(slug)
+    return _get_one(model, pk, item_id, db)
+
+@router.post("/dyn-params/{slug}", status_code=201)
+def create_dyn_param(slug: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    model, pk = _resolve_dyn_param(slug)
+    return _create_one(model, pk, body, db)
+
+@router.put("/dyn-params/{slug}/{item_id}")
+def update_dyn_param(slug: str, item_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    model, pk = _resolve_dyn_param(slug)
+    return _update_one(model, pk, item_id, body, db)
+
+@router.delete("/dyn-params/{slug}/{item_id}", status_code=204)
+def delete_dyn_param(slug: str, item_id: str, db: Session = Depends(get_db)):
+    model, pk = _resolve_dyn_param(slug)
+    _delete_one(model, pk, item_id, db)
 
 
 # ── ColumnDef ───────────────────────────────────────────────────────────────────────────────
@@ -795,6 +944,8 @@ def init_column_defs(db: Session = Depends(get_db)):
                 table_name=table_name,
                 column_name=col.name,
                 data_type=dt,
+                is_computed=False,
+                formula=None,
                 candidates="",
                 order_index=i,
             ))

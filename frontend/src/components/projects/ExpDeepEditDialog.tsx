@@ -570,7 +570,6 @@ export default function ExpDeepEditDialog({ open, initial, title, saving, projec
                 type: deriveFieldType(c.data_type ?? "string"),
                 options: c.candidates ? parseCandidateLabels(String(c.candidates)) : undefined,
               }));
-            if (dynFields.length === 0) dynFields.push({ key: "remarks", label: "remarks", type: "text" });
             NODE_DEFS[nodeKey] = {
               key: nodeKey, label: `${td.type_name} Parameter`,
               table: td.param_table, pkField: td.pk_col,

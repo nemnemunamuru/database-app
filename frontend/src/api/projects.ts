@@ -29,6 +29,9 @@ export interface ReportFieldSection {
 
 export interface ReportConfig {
   hidden_fields: string[];
+  layout_mode: "sectioned" | "combined_by_experiment";
+  chart_columns: number;
+  chart_width: number;
 }
 
 export const projectsApi = {
@@ -73,6 +76,9 @@ export const projectsApi = {
   exportDb: (id: string) =>
     `/api/projects/${id}/export/db`,
 
+  exportCsv: (id: string) =>
+    `/api/projects/${id}/export/csv`,
+
   reportMd: (id: string) =>
     `/api/projects/${id}/report/md`,
 
@@ -82,8 +88,8 @@ export const projectsApi = {
   getReportConfig: (id: string) =>
     api.get<ReportConfig>(`/api/projects/${id}/report/config`),
 
-  putReportConfig: (id: string, hidden_fields: string[]) =>
-    api.put<ReportConfig>(`/api/projects/${id}/report/config`, { hidden_fields }),
+  putReportConfig: (id: string, config: ReportConfig) =>
+    api.put<ReportConfig>(`/api/projects/${id}/report/config`, config),
 
   importDb: (file: File) => {
     const form = new FormData();
@@ -99,4 +105,9 @@ export const projectsApi = {
 
   setSetting: (projectId: string, key: string, value: string) =>
     api.put(`/api/projects/${projectId}/settings/${key}`, { value }),
+
+  writeResult: (projectId: string, expId: string, fields: Record<string, number>) =>
+    api.post<{ result_id: string } & Record<string, number>>(
+      `/api/projects/${projectId}/experiments/${expId}/write-result`, fields
+    ),
 };

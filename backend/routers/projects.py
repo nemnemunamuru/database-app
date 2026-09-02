@@ -11,20 +11,23 @@ Workflow:
   4. POST /api/projects/{id}/merge        → merge project into main DB
 """
 
+import csv
+import io
 import json
 import os
 import re
 import uuid
+import html
 from datetime import datetime
 
 from fastapi import APIRouter, Body, HTTPException, UploadFile, File as FastAPIFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 
-from backend.models import Base, Experiment, Project
+from backend.models import Base, Experiment, Project, Result
 from backend.routers.io import MODEL_ORDER
 
 router = APIRouter()
@@ -359,6 +362,30 @@ def list_project_experiments(project_id: str):
         db.close()
 
 
+@router.get("/{project_id}/export/csv")
+def export_project_experiments_csv(project_id: str):
+    """Export all project experiments with their related configuration fields."""
+    from backend.routers.experiments import _build_export_row
+
+    db = _project_session(project_id)
+    try:
+        rows = [_build_export_row(exp, db) for exp in db.query(Experiment).order_by(Experiment.experiment_id).all()]
+        columns = list(dict.fromkeys(key for row in rows for key in row))
+        output = io.StringIO()
+        output.write("\ufeff")
+        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in columns})
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=project_{project_id}_experiments.csv"},
+        )
+    finally:
+        db.close()
+
+
 # ── Create experiment in project ──────────────────────────────────────────────
 
 class ExperimentPayload(BaseModel):
@@ -428,6 +455,39 @@ def delete_project_experiment(project_id: str, experiment_id: str):
         db.delete(exp)
         db.commit()
         return {"message": "Deleted"}
+    finally:
+        db.close()
+
+
+# ── Write result fields for project experiment ────────────────────────────────
+
+_RESULT_NUMERIC_COLS = {"oct_depth_mm", "cross_section_depth_mm", "spatter_severity", "crack_severity"}
+
+@router.post("/{project_id}/experiments/{experiment_id}/write-result")
+def write_project_result(project_id: str, experiment_id: str, body: dict = Body(...)):
+    """Create-or-update the Result record for a project experiment."""
+    db = _project_session(project_id)
+    try:
+        exp = db.get(Experiment, experiment_id)
+        if not exp:
+            raise HTTPException(404, "Experiment not found")
+        safe = {k: float(v) for k, v in body.items() if k in _RESULT_NUMERIC_COLS and v is not None}
+        if not safe:
+            raise HTTPException(400, "No valid result fields provided")
+        if exp.result_id:
+            result = db.get(Result, exp.result_id)
+            if result:
+                for k, v in safe.items():
+                    setattr(result, k, v)
+                db.commit()
+                db.refresh(result)
+                return {"result_id": result.result_id, **safe}
+        new_result = Result(result_id=str(uuid.uuid4()), **safe)
+        db.add(new_result)
+        exp.result_id = new_result.result_id
+        db.commit()
+        db.refresh(new_result)
+        return {"result_id": new_result.result_id, **safe}
     finally:
         db.close()
 
@@ -812,6 +872,23 @@ _REPORT_SECTIONS = [
 ]
 
 
+def _normalize_report_field_key(key: str) -> str:
+    """Normalize role-specific report keys for settings selection."""
+    if not key:
+        return key
+    s = str(key)
+    s = re.sub(r"^Optics\[[^\]]+\]", "Optics", s)
+    s = re.sub(r"^Optics\s+role\d+", "Optics", s)
+    s = re.sub(r"^Role\[[^\]]+\]", "Role", s)
+    s = re.sub(r"^Role\d+", "Role", s)
+    return s
+
+
+def _is_hidden_report_field(raw_key: str, hidden_set: set[str]) -> bool:
+    # Backward compatible: accept both legacy raw keys and normalized keys.
+    return raw_key in hidden_set or _normalize_report_field_key(raw_key) in hidden_set
+
+
 def _collect_report_sections(project_id: str):
     """Return (exp_rows, all_sections) for use by /report/fields and /report/md."""
     from backend.database import SessionLocal
@@ -927,8 +1004,12 @@ def _collect_report_sections(project_id: str):
                 optics_list = fetch_optics_rows(gs.get("optics_id"))
                 multi = len(optics_list) > 1
                 for oi, orow in enumerate(optics_list, 1):
-                    pfx = f"Optics {oi}" if multi else "Optics"
-                    scalar_orow = {k: v for k, v in orow.items() if k not in ("laser_device", "doe")}
+                    role_name = (orow.get("optics_role") or "").strip()
+                    if role_name:
+                        pfx = f"Optics[{role_name}]"
+                    else:
+                        pfx = f"Optics role{oi}" if multi else "Optics"
+                    scalar_orow = {k: v for k, v in orow.items() if k not in ("laser_device", "doe", "optics_role")}
                     optics.update(_flat(pfx, scalar_orow))
                     ld = orow.get("laser_device")
                     ld_pfx = f"{pfx} / Laser Device"
@@ -943,14 +1024,30 @@ def _collect_report_sections(project_id: str):
             all_sections["Optics"].append(optics)
 
             # Experiment Material
-            em = fetch(ExperimentMaterial, exp.get("experiment_material_id"))
-            mat_data = _flat("", em)
-            if em:
-                ms = fetch(MaterialState, em.get("material_state_id"))
-                mat_data.update(_flat("Material State", ms))
+            mat_data: dict = {}
+            em_id = exp.get("experiment_material_id")
+            em_rows = []
+            if em_id:
+                em_rows = proj_db2.query(ExperimentMaterial).filter(
+                    ExperimentMaterial.experiment_material_id == em_id
+                ).all()
+                if not em_rows:
+                    em_rows = main_db.query(ExperimentMaterial).filter(
+                        ExperimentMaterial.experiment_material_id == em_id
+                    ).all()
+
+            for ei, em_row in enumerate(em_rows, 1):
+                em_obj = {c.name: getattr(em_row, c.name) for c in em_row.__table__.columns}
+                role_name = (em_obj.get("material_role") or "").strip()
+                rpfx = f"Role[{role_name}]" if role_name else f"Role{ei}"
+                scalar_em = {k: v for k, v in em_obj.items() if k not in ("material_state_id", "material_role")}
+                mat_data.update(_flat(rpfx, scalar_em))
+
+                ms = fetch(MaterialState, em_obj.get("material_state_id"))
+                mat_data.update(_flat(f"{rpfx} / Material State", ms))
                 if ms:
                     mat = fetch(Material, ms.get("material_id"))
-                    mat_data.update(_flat("Material", mat))
+                    mat_data.update(_flat(f"{rpfx} / Material", mat))
             all_sections["Experiment Material"].append(mat_data)
 
             # Shielding Condition
@@ -987,16 +1084,17 @@ def get_report_fields(project_id: str):
         seen_set: set = set()
         for d in sec_data:
             for k in d:
-                if k not in seen_set:
-                    seen.append(k)
-                    seen_set.add(k)
+                nk = _normalize_report_field_key(k)
+                if nk not in seen_set:
+                    seen.append(nk)
+                    seen_set.add(nk)
         result.append({"section": sec, "fields": seen})
     return result
 
 
 @router.get("/{project_id}/report/config")
 def get_report_config(project_id: str):
-    """Return current report display config (hidden_fields) for a project."""
+    """Return current report display config for a project."""
     from backend.settings_database import SessionLocal as SettingsSession, ReportConfig as RC
     manifest = _load_manifest()
     if project_id not in manifest:
@@ -1005,19 +1103,39 @@ def get_report_config(project_id: str):
     try:
         rc = db.get(RC, project_id)
         hidden = json.loads(rc.hidden_fields) if rc and rc.hidden_fields else []
-        return {"hidden_fields": hidden}
+        layout_mode = rc.layout_mode if rc and rc.layout_mode else "sectioned"
+        chart_columns = int(rc.chart_columns) if rc and rc.chart_columns else 2
+        chart_width = int(rc.chart_width) if rc and rc.chart_width else 640
+        return {
+            "hidden_fields": hidden,
+            "layout_mode": layout_mode,
+            "chart_columns": chart_columns,
+            "chart_width": chart_width,
+        }
     finally:
         db.close()
 
 
 @router.put("/{project_id}/report/config")
 def put_report_config(project_id: str, body: dict = Body(...)):
-    """Save report display config (hidden_fields) for a project."""
+    """Save report display config for a project."""
     from backend.settings_database import SessionLocal as SettingsSession, ReportConfig as RC
     manifest = _load_manifest()
     if project_id not in manifest:
         raise HTTPException(404, f"Project '{project_id}' not found")
     hidden = body.get("hidden_fields", [])
+    layout_mode = body.get("layout_mode") or "sectioned"
+    if layout_mode not in {"sectioned", "combined_by_experiment"}:
+        raise HTTPException(400, "Invalid layout_mode")
+    try:
+        chart_columns = int(body.get("chart_columns", 2))
+        chart_width = int(body.get("chart_width", 640))
+    except Exception:
+        raise HTTPException(400, "Invalid chart layout values")
+    if chart_columns < 1 or chart_columns > 6:
+        raise HTTPException(400, "chart_columns must be between 1 and 6")
+    if chart_width < 120 or chart_width > 3000:
+        raise HTTPException(400, "chart_width must be between 120 and 3000")
     db = SettingsSession()
     try:
         rc = db.get(RC, project_id)
@@ -1025,8 +1143,16 @@ def put_report_config(project_id: str, body: dict = Body(...)):
             rc = RC(project_id=project_id)
             db.add(rc)
         rc.hidden_fields = json.dumps(hidden, ensure_ascii=False)
+        rc.layout_mode = layout_mode
+        rc.chart_columns = chart_columns
+        rc.chart_width = chart_width
         db.commit()
-        return {"hidden_fields": hidden}
+        return {
+            "hidden_fields": hidden,
+            "layout_mode": layout_mode,
+            "chart_columns": chart_columns,
+            "chart_width": chart_width,
+        }
     finally:
         db.close()
 
@@ -1044,11 +1170,12 @@ def export_project_report_md(project_id: str):
         raise HTTPException(404, f"Project '{project_id}' not found")
     proj_name = manifest[project_id].get("name", project_id)
 
-    # Load hidden fields config
+    # Load report config
     s_db = SettingsSession()
     try:
         rc = s_db.get(RC, project_id)
         hidden_set: set = set(json.loads(rc.hidden_fields) if rc and rc.hidden_fields else [])
+        layout_mode = rc.layout_mode if rc and rc.layout_mode else "sectioned"
     finally:
         s_db.close()
 
@@ -1056,8 +1183,41 @@ def export_project_report_md(project_id: str):
     n = len(exp_rows)
     exp_labels = [exp.get("experiment_id", f"No.{i}") for i, exp in enumerate(exp_rows, 1)]
 
+    def _table_metrics(col_count: int) -> tuple[str, str]:
+        # PDF用: 列数が増えるほどフォントと余白を小さくして横幅内に収める
+        if col_count >= 18:
+            return "8px", "2px 4px"
+        if col_count >= 12:
+            return "9px", "2px 5px"
+        if col_count >= 8:
+            return "10px", "3px 6px"
+        return "11px", "4px 8px"
+
+    def _html_table(headers: list[str], rows: list[list[str]]) -> str:
+        if not headers:
+            return ""
+        fz, pad = _table_metrics(len(headers))
+        head = "".join(
+            f'<th style="border:1px solid #999;padding:{pad};text-align:left;white-space:normal;word-break:break-word;">{html.escape(str(h))}</th>'
+            for h in headers
+        )
+        body_rows = []
+        for row in rows:
+            cols = "".join(
+                f'<td style="border:1px solid #b5b5b5;padding:{pad};vertical-align:top;white-space:normal;word-break:break-word;">{html.escape(str(c))}</td>'
+                for c in row
+            )
+            body_rows.append(f"<tr>{cols}</tr>")
+        return (
+            f'<div style="max-width:100%;overflow-x:hidden;">'
+            f'<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:{fz};line-height:1.25;">'
+            f"<thead><tr>{head}</tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody>"
+            f"</table></div>"
+        )
+
     def _wide_tables(sec_exps: list) -> tuple:
-        """Return (common_md, varying_md) for a section, respecting hidden_set."""
+        """Return (common_html, varying_html) for a section, respecting hidden_set."""
         all_keys: list = []
         seen: set = set()
         for d in sec_exps:
@@ -1066,7 +1226,7 @@ def export_project_report_md(project_id: str):
                     all_keys.append(k)
                     seen.add(k)
         # Filter out hidden fields
-        all_keys = [k for k in all_keys if k not in hidden_set]
+        all_keys = [k for k in all_keys if not _is_hidden_report_field(k, hidden_set)]
         if not all_keys:
             return "", ""
 
@@ -1076,55 +1236,82 @@ def export_project_report_md(project_id: str):
 
         common_md = ""
         if common_keys:
-            rows = ["| Parameter | Value |", "|---|---|"]
-            for k in common_keys:
-                rows.append(f"| {k} | {_v(sec_exps[0].get(k))} |")
-            common_md = "\n".join(rows) + "\n"
+            common_rows = [[k, _v(sec_exps[0].get(k))] for k in common_keys]
+            common_md = _html_table(["Parameter", "Value"], common_rows) + "\n"
 
         varying_md = ""
         if varying_keys:
-            header = "| Experiment ID | " + " | ".join(varying_keys) + " |"
-            sep = "|---|" + "---|" * len(varying_keys)
-            rows = [header, sep]
+            headers = ["Experiment ID", *varying_keys]
+            var_rows = []
             for label, d in zip(exp_labels, sec_exps):
-                cells = " | ".join(_v(d.get(k)) for k in varying_keys)
-                rows.append(f"| {label} | {cells} |")
-            varying_md = "\n".join(rows) + "\n"
+                var_rows.append([label, *[_v(d.get(k)) for k in varying_keys]])
+            varying_md = _html_table(headers, var_rows) + "\n"
 
         return common_md, varying_md
+
+    def _combined_table_md() -> str:
+        visible_keys: list[str] = []
+        seen: set[str] = set()
+        for sec in _REPORT_SECTIONS:
+            for d in all_sections[sec]:
+                for k in d:
+                    if _is_hidden_report_field(k, hidden_set) or k in seen:
+                        continue
+                    visible_keys.append(k)
+                    seen.add(k)
+        headers = ["Experiment ID", *visible_keys]
+        rows: list[list[str]] = []
+        for label, idx in zip(exp_labels, range(len(exp_rows))):
+            merged: dict[str, object] = {}
+            for sec in _REPORT_SECTIONS:
+                merged.update(all_sections[sec][idx] or {})
+            rows.append([label, *[_v(merged.get(k)) for k in visible_keys]])
+        return _html_table(headers, rows) + "\n"
 
     lines: list = []
     lines.append(f"# Project Report: {proj_name}")
     lines.append(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"\nTotal experiments: {n}\n")
+    lines.append(
+        "<style>"
+        "@page{size:A4 landscape;margin:8mm;}"
+        "table{max-width:100%;}"
+        "th,td{box-sizing:border-box;}"
+        "</style>\n"
+    )
     lines.append("---\n")
 
     # Experiment overview
     lines.append("## 実験一覧\n")
-    lines.append("| Experiment ID | Remarks |")
-    lines.append("|---|---|")
+    overview_rows: list[list[str]] = []
     for exp in exp_rows:
         exp_id = exp.get("experiment_id") or "—"
         remarks = exp.get("remarks") or "—"
-        lines.append(f"| {exp_id} | {remarks} |")
+        overview_rows.append([str(exp_id), str(remarks)])
+    lines.append(_html_table(["Experiment ID", "Remarks"], overview_rows))
     lines.append("\n---\n")
 
-    # One section block per section
-    for sec in _REPORT_SECTIONS:
-        sec_data = all_sections[sec]
-        if all(not d for d in sec_data):
-            continue
-        lines.append(f"## {sec}\n")
-        common_md, varying_md = _wide_tables(sec_data)
-        if common_md:
-            lines.append("### 共通項目\n")
-            lines.append(common_md)
-        if varying_md:
-            lines.append("### 実験別パラメータ\n")
-            lines.append(varying_md)
-        if not common_md and not varying_md:
-            lines.append("*(no data)*\n")
+    if layout_mode == "combined_by_experiment":
+        lines.append("## 実験別統合テーブル\n")
+        lines.append(_combined_table_md())
         lines.append("\n---\n")
+    else:
+        # One section block per section
+        for sec in _REPORT_SECTIONS:
+            sec_data = all_sections[sec]
+            if all(not d for d in sec_data):
+                continue
+            lines.append(f"## {sec}\n")
+            common_md, varying_md = _wide_tables(sec_data)
+            if common_md:
+                lines.append("### 共通項目\n")
+                lines.append(common_md)
+            if varying_md:
+                lines.append("### 実験別パラメータ\n")
+                lines.append(varying_md)
+            if not common_md and not varying_md:
+                lines.append("*(no data)*\n")
+            lines.append("\n---\n")
 
     content = "\n".join(lines)
     filename = f"{proj_name}_report.md"

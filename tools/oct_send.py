@@ -7,6 +7,11 @@ OCT PC 用 -- CSV パスをデータベースサーバーに送信するツー�
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
+import os
+import csv
+import sys
+import json
+import shutil
 
 try:
     import requests
@@ -21,6 +26,94 @@ SERVER_LOCAL = "http://localhost:8000"
 SERVER_REMOTE = "http://192.168.10.200:8000"
 # ---------------------------------------------------------------------------
 
+MEASURE_LOG_PATH = "E:/Logs/OCT"
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "oct_send_config.json")
+
+
+def load_app_config() -> dict:
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_app_config(data: dict) -> tuple[bool, str]:
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True, "設定を保存しました"
+    except Exception as e:
+        return False, f"設定保存に失敗: {e}"
+
+
+def _arg_or_none(args: list[str], idx: int) -> str | None:
+    return args[idx] if len(args) > idx and str(args[idx]).strip() else None
+
+
+def parse_oct_args(argv: list[str]) -> dict[str, str | None]:
+    # send.py compatibility
+    return {
+        "RecipeName": _arg_or_none(argv, 1),
+        "ProcPos": _arg_or_none(argv, 2),
+        "ProcType": _arg_or_none(argv, 3),
+        "timeStamp": _arg_or_none(argv, 5),
+    }
+
+
+def _try_read_csv(csv_path: str) -> tuple[bool, str]:
+    if not os.path.isfile(csv_path):
+        return False, f"入力CSVなし: {csv_path}"
+
+    for enc in ("utf-8-sig", "utf-8", "shift_jis", "cp932"):
+        try:
+            with open(csv_path, encoding=enc, newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+                    delimiter = dialect.delimiter
+                except Exception:
+                    delimiter = ","
+
+                reader = csv.reader(f, delimiter=delimiter)
+                rows = list(reader)
+            if len(rows) < 2:
+                return False, "CSV読み込み: データ行なし"
+            return True, f"CSV読み込みOK ({len(rows)-1}行)"
+        except UnicodeDecodeError:
+            continue
+    return False, "CSV読み込み失敗: 対応エンコーディング外"
+
+
+def build_result_csv_from_args(args_map: dict[str, str | None], output_dir: str) -> tuple[str | None, str]:
+    proc_pos = args_map.get("ProcPos")
+    proc_type = args_map.get("ProcType")
+    timestamp = args_map.get("timeStamp")
+
+    if proc_type != "1":
+        return None, "ProcType が '1' ではないため未生成"
+    if not proc_pos or not timestamp:
+        return None, "ProcPos / timeStamp が不足しているため未生成"
+
+    input_path = os.path.join(MEASURE_LOG_PATH, f"ResultLog_{timestamp}_{proc_pos}.csv")
+    ok, msg = _try_read_csv(input_path)
+    if not ok:
+        return None, f"Result CSV 未生成 ({msg})"
+
+    out_dir = output_dir.strip() if output_dir else ""
+    if not out_dir:
+        return None, "Result CSV 未生成 (出力先が未設定)"
+
+    out_name = f"ResultByPython_{proc_pos}_{proc_type}.csv"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, out_name)
+
+    shutil.copy2(input_path, out_path)
+
+    return out_path, f"Result CSV を出力: {out_name} / {msg}"
+
 
 class OctSendApp(tk.Tk):
     def __init__(self):
@@ -28,17 +121,20 @@ class OctSendApp(tk.Tk):
         self.title("OCT CSV 送信")
         self.resizable(False, False)
         self.configure(padx=16, pady=12)
+        self._cfg = load_app_config()
 
         # サーバー URL 行
         url_frame = tk.Frame(self)
         url_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         tk.Label(url_frame, text="サーバー URL:", anchor="w").pack(side="left")
-        self._url_var = tk.StringVar(value=SERVER_LOCAL)
+        self._url_var = tk.StringVar(value=self._cfg.get("server_url") or SERVER_LOCAL)
         tk.Entry(url_frame, textvariable=self._url_var, width=32).pack(side="left", padx=(6, 4))
         tk.Button(url_frame, text="localhost", relief="groove", padx=4,
                   command=lambda: self._url_var.set(SERVER_LOCAL)).pack(side="left", padx=2)
         tk.Button(url_frame, text="192.168.10.200", relief="groove", padx=4,
                   command=lambda: self._url_var.set(SERVER_REMOTE)).pack(side="left", padx=2)
+        tk.Button(url_frame, text="保存", relief="groove", padx=6,
+                  command=self._save_preferences).pack(side="left", padx=(6, 0))
 
         # 待受中実験表示
         self._exp_var = tk.StringVar(value="確認中...")
@@ -51,27 +147,50 @@ class OctSendApp(tk.Tk):
         )
         self._exp_label.pack(side="left", padx=4, pady=3)
 
-        # CSV パス入力 x 3
-        self._vars: dict = {}
-        rows = [
-            ("oct_surface_csv_path", "Surface CSV"),
-            ("oct_depth_csv_path",   "Depth   CSV"),
-            ("oct_result_csv_path",  "Result  CSV"),
+        # CLI args 表示
+        self._args_map = parse_oct_args(sys.argv)
+        args_frame = tk.LabelFrame(self, text="起動引数 (send.py 互換)", padx=8, pady=6)
+        args_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+
+        self._arg_vars: dict[str, tk.StringVar] = {}
+        arg_rows = [
+            ("RecipeName", "品種"),
+            ("ProcPos", "加工位置"),
+            ("ProcType", "加工種別"),
+            ("timeStamp", "計測ログ日時"),
         ]
-        for i, (key, label) in enumerate(rows):
-            var = tk.StringVar()
-            self._vars[key] = var
-            tk.Label(self, text=label + ":", anchor="w", width=14).grid(
-                row=2 + i, column=0, sticky="w", pady=3)
-            tk.Entry(self, textvariable=var, width=48).grid(
-                row=2 + i, column=1, sticky="ew", padx=(4, 4))
-            tk.Button(self, text="参照...",
-                      command=lambda v=var: self._browse(v)).grid(
-                row=2 + i, column=2, sticky="w")
+        for i, (k, label) in enumerate(arg_rows):
+            tk.Label(args_frame, text=f"{label}:", width=12, anchor="w").grid(row=i, column=0, sticky="w")
+            sv = tk.StringVar(value=self._args_map.get(k) or "無し")
+            self._arg_vars[k] = sv
+            fg = "#1565c0" if self._args_map.get(k) else "gray"
+            tk.Label(args_frame, textvariable=sv, anchor="w", fg=fg, font=("Courier", 10, "bold")).grid(row=i, column=1, sticky="w", padx=(4, 0))
+
+        self._auto_status_var = tk.StringVar(value="送信時に自動判定します")
+        tk.Label(args_frame, textvariable=self._auto_status_var, anchor="w", fg="#2e7d32").grid(
+            row=len(arg_rows), column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
+        self._result_path_var = tk.StringVar(value="")
+        tk.Label(args_frame, text="出力Result CSV:", width=12, anchor="w").grid(
+            row=len(arg_rows)+1, column=0, sticky="w", pady=(4, 0)
+        )
+        tk.Label(args_frame, textvariable=self._result_path_var, anchor="w", fg="#455a64").grid(
+            row=len(arg_rows)+1, column=1, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
+        out_frame = tk.LabelFrame(self, text="出力先", padx=8, pady=6)
+        out_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        default_out = self._cfg.get("output_dir") or os.path.join(os.path.dirname(__file__), "save")
+        self._out_dir_var = tk.StringVar(value=default_out)
+        tk.Label(out_frame, text="フォルダ:", width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Entry(out_frame, textvariable=self._out_dir_var, width=46).grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        tk.Button(out_frame, text="参照...", command=self._choose_output_dir).grid(row=0, column=2, sticky="w")
+        tk.Button(out_frame, text="適用", command=self._apply_result_csv).grid(row=0, column=3, sticky="w", padx=(6, 0))
 
         # ボタン行
         btn_frame = tk.Frame(self)
-        btn_frame.grid(row=5, column=0, columnspan=3, pady=(14, 2))
+        btn_frame.grid(row=4, column=0, columnspan=3, pady=(14, 2))
         self._send_btn = tk.Button(
             btn_frame, text="送信", width=12,
             bg="#7b1fa2", fg="white", font=("Arial", 10, "bold"),
@@ -88,12 +207,20 @@ class OctSendApp(tk.Tk):
     def _server(self) -> str:
         return self._url_var.get().rstrip("/")
 
-    def _browse(self, var: tk.StringVar):
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
-        if path:
-            var.set(path)
+    def _choose_output_dir(self):
+        d = filedialog.askdirectory(initialdir=self._out_dir_var.get() or os.getcwd())
+        if d:
+            self._out_dir_var.set(d)
+
+    def _save_preferences(self):
+        ok, msg = save_app_config({
+            "server_url": self._url_var.get().strip(),
+            "output_dir": self._out_dir_var.get().strip(),
+        })
+        if ok:
+            messagebox.showinfo("設定", msg)
+        else:
+            messagebox.showerror("設定", msg)
 
     def _refresh_status(self):
         def fetch():
@@ -115,15 +242,28 @@ class OctSendApp(tk.Tk):
                 self.after(1000, self._refresh_status)
         threading.Thread(target=fetch, daemon=True).start()
 
+    def _apply_result_csv(self) -> tuple[str | None, str]:
+        out_path, status = build_result_csv_from_args(self._args_map, output_dir=self._out_dir_var.get())
+        self._auto_status_var.set(status)
+        self._result_path_var.set(out_path or "")
+        return out_path, status
+
+    def _build_auto_payload(self) -> tuple[dict[str, str], str]:
+        out_path, status = self._apply_result_csv()
+        if not out_path:
+            return {}, status
+        return {"oct_result_csv_path": out_path}, status
+
     # -- 送信 ------------------------------------------------------------------
     def _on_send(self):
-        payload = {k: v.get().strip() for k, v in self._vars.items() if v.get().strip()}
+        payload, status = self._build_auto_payload()
         if not payload:
-            messagebox.showwarning("入力エラー", "CSV パスを少なくとも1つ入力してください。")
+            messagebox.showwarning("自動判定", status)
             return
 
         exp_id = self._exp_var.get()
         msg = f"実験 [{exp_id}] に送信しますか？\n\n"
+        msg += f"判定結果: {status}\n\n"
         msg += "\n".join(f"  {k}:\n  {v}" for k, v in payload.items())
         if not messagebox.askyesno("確認", msg):
             return

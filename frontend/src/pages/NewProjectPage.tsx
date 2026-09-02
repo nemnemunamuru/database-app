@@ -3,7 +3,7 @@ import {
   Accordion, AccordionDetails, AccordionSummary,
   Alert, Box, Button, Checkbox, CircularProgress, Dialog,
   DialogActions, DialogContent, DialogTitle, Divider,
-  FormControlLabel, FormGroup,
+  FormControl, FormControlLabel, FormGroup, FormLabel, Radio, RadioGroup,
   IconButton, List, ListItemButton, ListItemText,
   Paper, Snackbar, Tab, Tabs, Table, TableBody, TableCell, TableContainer,
   TableHead, TableRow, TextField, Tooltip, Typography,
@@ -19,6 +19,7 @@ import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import DescriptionIcon from "@mui/icons-material/Description";
 import DownloadIcon from "@mui/icons-material/Download";
 import FolderOpenIcon from "@mui/icons-material/FolderOpen";
+import TableViewIcon from "@mui/icons-material/TableView";
 import TuneIcon from "@mui/icons-material/Tune";
 import type { Project, ProjectExperiment } from "../api/projects";
 import { projectsApi } from "../api/projects";
@@ -563,6 +564,9 @@ interface ReportSettingsDialogProps {
 function ReportSettingsDialog({ open, projectId, onClose }: ReportSettingsDialogProps) {
   const [sections, setSections] = useState<{ section: string; fields: string[] }[]>([]);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
+  const [layoutMode, setLayoutMode] = useState<"sectioned" | "combined_by_experiment">("sectioned");
+  const [chartColumns, setChartColumns] = useState(2);
+  const [chartWidth, setChartWidth] = useState(640);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -575,6 +579,9 @@ function ReportSettingsDialog({ open, projectId, onClose }: ReportSettingsDialog
     ]).then(([fieldsRes, configRes]) => {
       setSections(fieldsRes.data);
       setHidden(new Set(configRes.data.hidden_fields));
+      setLayoutMode(configRes.data.layout_mode ?? "sectioned");
+      setChartColumns(configRes.data.chart_columns ?? 2);
+      setChartWidth(configRes.data.chart_width ?? 640);
     }).finally(() => setLoading(false));
   }, [open, projectId]);
 
@@ -599,7 +606,12 @@ function ReportSettingsDialog({ open, projectId, onClose }: ReportSettingsDialog
   const handleSave = async () => {
     setSaving(true);
     try {
-      await projectsApi.putReportConfig(projectId, Array.from(hidden));
+      await projectsApi.putReportConfig(projectId, {
+        hidden_fields: Array.from(hidden),
+        layout_mode: layoutMode,
+        chart_columns: Math.max(1, Math.min(6, Number.isFinite(chartColumns) ? chartColumns : 2)),
+        chart_width: Math.max(120, Math.min(3000, Number.isFinite(chartWidth) ? chartWidth : 640)),
+      });
       onClose();
     } finally {
       setSaving(false);
@@ -613,45 +625,79 @@ function ReportSettingsDialog({ open, projectId, onClose }: ReportSettingsDialog
         {loading ? (
           <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
         ) : (
-          sections.map(({ section, fields }) => {
-            const allChecked = fields.every(f => !hidden.has(f));
-            const someChecked = fields.some(f => !hidden.has(f));
-            return (
-              <Accordion key={section} disableGutters defaultExpanded
-                sx={{ "&:before": { display: "none" }, borderBottom: 1, borderColor: "divider" }}>
-                <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 40, "& .MuiAccordionSummary-content": { alignItems: "center", my: 0 } }}>
-                  <FormControlLabel
-                    onClick={(e) => e.stopPropagation()}
-                    control={
-                      <Checkbox
-                        checked={allChecked}
-                        indeterminate={!allChecked && someChecked}
-                        onChange={() => toggleSection(fields)}
-                        size="small"
-                      />
-                    }
-                    label={<Typography fontWeight={600} fontSize={14}>{section}</Typography>}
-                    sx={{ mr: 0 }}
-                  />
-                  <Typography variant="caption" color="text.secondary" sx={{ ml: "auto", mr: 1 }}>
-                    {fields.filter(f => !hidden.has(f)).length} / {fields.length}
-                  </Typography>
-                </AccordionSummary>
-                <AccordionDetails sx={{ pt: 0, pb: 1, pl: 4 }}>
-                  <FormGroup>
-                    {fields.map(f => (
-                      <FormControlLabel
-                        key={f}
-                        control={<Checkbox checked={!hidden.has(f)} onChange={() => toggleField(f)} size="small" />}
-                        label={<Typography fontSize={12} fontFamily="monospace">{f}</Typography>}
-                        sx={{ mb: 0, height: 28 }}
-                      />
-                    ))}
-                  </FormGroup>
-                </AccordionDetails>
-              </Accordion>
-            );
-          })
+          <>
+            <Box sx={{ px: 3, py: 2, borderBottom: 1, borderColor: "divider", bgcolor: "background.default" }}>
+              <FormControl fullWidth>
+                <FormLabel sx={{ mb: 1, fontSize: 14, fontWeight: 600, color: "text.primary" }}>Table Layout</FormLabel>
+                <RadioGroup value={layoutMode} onChange={(e) => setLayoutMode(e.target.value as "sectioned" | "combined_by_experiment") }>
+                  <FormControlLabel value="sectioned" control={<Radio size="small" />} label="Current: separate table for each section" />
+                  <FormControlLabel value="combined_by_experiment" control={<Radio size="small" />} label="Combine selected items into one table by experiment ID" />
+                </RadioGroup>
+              </FormControl>
+              <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 1.25, mt: 1.25 }}>
+                <TextField
+                  size="small"
+                  label="Charts per row"
+                  type="number"
+                  inputProps={{ min: 1, max: 6 }}
+                  value={chartColumns}
+                  onChange={(e) => setChartColumns(Number(e.target.value || 2))}
+                  helperText="1-6"
+                />
+                <TextField
+                  size="small"
+                  label="Chart width (px)"
+                  type="number"
+                  inputProps={{ min: 120, max: 3000 }}
+                  value={chartWidth}
+                  onChange={(e) => setChartWidth(Number(e.target.value || 640))}
+                  helperText="Image render width"
+                />
+              </Box>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                role項目は1つ選ぶと、同じrole系の複数行に自動適用されます。
+              </Typography>
+            </Box>
+            {sections.map(({ section, fields }) => {
+              const allChecked = fields.every(f => !hidden.has(f));
+              const someChecked = fields.some(f => !hidden.has(f));
+              return (
+                <Accordion key={section} disableGutters defaultExpanded
+                  sx={{ "&:before": { display: "none" }, borderBottom: 1, borderColor: "divider" }}>
+                  <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ minHeight: 40, "& .MuiAccordionSummary-content": { alignItems: "center", my: 0 } }}>
+                    <FormControlLabel
+                      onClick={(e) => e.stopPropagation()}
+                      control={
+                        <Checkbox
+                          checked={allChecked}
+                          indeterminate={!allChecked && someChecked}
+                          onChange={() => toggleSection(fields)}
+                          size="small"
+                        />
+                      }
+                      label={<Typography sx={{ fontWeight: 600, fontSize: 14 }}>{section}</Typography>}
+                      sx={{ mr: 0 }}
+                    />
+                    <Typography variant="caption" color="text.secondary" sx={{ ml: "auto", mr: 1 }}>
+                      {fields.filter(f => !hidden.has(f)).length} / {fields.length}
+                    </Typography>
+                  </AccordionSummary>
+                  <AccordionDetails sx={{ pt: 0, pb: 1, pl: 4 }}>
+                    <FormGroup>
+                      {fields.map(f => (
+                        <FormControlLabel
+                          key={f}
+                          control={<Checkbox checked={!hidden.has(f)} onChange={() => toggleField(f)} size="small" />}
+                          label={<Typography sx={{ fontSize: 12, fontFamily: "monospace" }}>{f}</Typography>}
+                          sx={{ mb: 0, height: 28 }}
+                        />
+                      ))}
+                    </FormGroup>
+                  </AccordionDetails>
+                </Accordion>
+              );
+            })}
+          </>
         )}
       </DialogContent>
       <DialogActions>
@@ -799,8 +845,8 @@ export default function NewProjectPage() {
   useEffect(() => {
     const TABLES = [
       "GALVANO_SYSTEM", "FTHETA", "OPTICS", "LASER_DEVICE", "LASER_BEAM", "DOE",
-      "WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "LINE_PARAMETER",
-      "SUB_TRAJECTORY", "WOBBLING_PARAMETER",
+      "WELDING_CONDITION", "TRAJECTORY_SET", "MAIN_TRAJECTORY", "CIRCLE_PARAMETER", "LINE_PARAMETER", "SPIRAL_PARAMETER",
+      "SUB_TRAJECTORY", "EIGHT_PARAMETER", "RASTER_PARAMETER", "WOBBLING_PARAMETER",
       "EXPERIMENT_MATERIAL", "MATERIAL_STATE", "MATERIAL",
       "SHIELDING_CONDITION", "RESULT", "OBSERVATION", "FILE",
     ];
@@ -1211,6 +1257,14 @@ export default function NewProjectPage() {
                     onClick={() => window.open(`http://localhost:8000${projectsApi.exportDb(selectedId!)}`, "_blank")}
                   >
                     <DownloadIcon fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title="Export project experiments as CSV">
+                  <IconButton
+                    size="small"
+                    onClick={() => window.open(`http://localhost:8000${projectsApi.exportCsv(selectedId!)}`, "_blank")}
+                  >
+                    <TableViewIcon fontSize="small" />
                   </IconButton>
                 </Tooltip>
                 <Tooltip title="Delete project">
